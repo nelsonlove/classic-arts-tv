@@ -7,15 +7,23 @@ struct Card: Identifiable, Decodable, Equatable {
     let firstSeen: String
     let lastSeen: String
     let lines: [String]
+    let cleanLines: [String]?
     let thumb: String
 
     enum CodingKeys: String, CodingKey {
         case id, lines, thumb
+        case cleanLines = "clean_lines"
         case firstSeen = "first_seen"
         case lastSeen = "last_seen"
     }
 
-    var text: String { lines.joined(separator: "\n") }
+    /// The model-corrected reading when the watcher has one, else the raw OCR.
+    var displayLines: [String] {
+        if let cleanLines, !cleanLines.isEmpty { return cleanLines }
+        return lines
+    }
+
+    var text: String { displayLines.joined(separator: "\n") }
     var when: Date? { ISO8601DateFormatter().date(from: firstSeen) }
 }
 
