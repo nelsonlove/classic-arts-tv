@@ -1,24 +1,67 @@
 import SwiftUI
 import AVKit
 
-/// One full-screen live player, with a spinner while it tunes in and a retry button when it fails.
+/// One full-screen live player, with a spinner while it tunes in, a retry button when it fails, and the watcher's credits.
 struct PlayerScreen: View {
     @StateObject private var model = PlayerModel()
+    @StateObject private var client = WatcherClient()
     @Environment(\.scenePhase) private var scenePhase
+    @State private var bannerCard: Card?
+    @State private var showList = false
+    @State private var bannerTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            VideoPlayer(player: model.player)
-                .ignoresSafeArea()
+            player.ignoresSafeArea()
             overlay
         }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active { model.resumeIfNeeded() }
+        .overlay(alignment: .top) {
+            if let card = bannerCard { NowPlayingBanner(card: card) }
         }
+        .animation(.easeInOut, value: bannerCard)
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                model.resumeIfNeeded()
+                client.start()
+            } else {
+                client.stop()
+            }
+        }
+        .onChange(of: client.now) { old, new in
+            guard let new, new.id != old?.id else { return }
+            showBanner(new)
+        }
+        .onAppear { client.start() }
         #if os(iOS)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        .overlay(alignment: .bottomTrailing) {
+            Button { showList = true } label: {
+                Image(systemName: "list.bullet")
+                    .font(.title3)
+                    .padding(10)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .padding()
+            .opacity(0.8)
+        }
+        .sheet(isPresented: $showList) {
+            NavigationStack {
+                RecentListView(client: client)
+                    .navigationTitle("Recently played")
+                    .toolbar { Button("Done") { showList = false } }
+            }
+        }
+        #endif
+    }
+
+    @ViewBuilder
+    private var player: some View {
+        #if os(tvOS)
+        TVPlayerView(player: model.player, client: client)
+        #else
+        VideoPlayer(player: model.player)
         #endif
     }
 
@@ -44,4 +87,33 @@ struct PlayerScreen: View {
             EmptyView()
         }
     }
+
+    private func showBanner(_ card: Card) {
+        bannerTask?.cancel()
+        bannerCard = card
+        bannerTask = Task {
+            try? await Task.sleep(for: .seconds(12))
+            if !Task.isCancelled { bannerCard = nil }
+        }
+    }
 }
+
+#if os(tvOS)
+/// The native Apple TV player, with the recently-played list as a tab in its Info panel (swipe down on the remote).
+struct TVPlayerView: UIViewControllerRepresentable {
+    let player: AVPlayer
+    let client: WatcherClient
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let controller = AVPlayerViewController()
+        controller.player = player
+        let info = UIHostingController(rootView: RecentListView(client: client))
+        info.title = "Recently played"
+        info.preferredContentSize = CGSize(width: 1920, height: 560)
+        controller.customInfoViewControllers = [info]
+        return controller
+    }
+
+    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {}
+}
+#endif
