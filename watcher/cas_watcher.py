@@ -53,6 +53,11 @@ THUMBS = CONFIG["CAS_DATA"] / "thumbs"
 CARD_HINTS = re.compile(r"\b(music by|conductor|orchestra|choreograph|performed|directed|produced|libretto|soprano|tenor|baritone|pianist|violin|ballet|opera|symphony|quartet|philharmonic|ltd|inc|records|films?)\b", re.I)
 
 
+def no_proxy_env() -> dict:
+    """The stream must not go through a proxy set for the model endpoint (HTTPS_PROXY on a tailnet-joined container)."""
+    return {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+
+
 def log(*parts):
     print(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), *parts, flush=True)
 
@@ -268,7 +273,7 @@ class Watcher(threading.Thread):
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
              "-of", "csv=p=0", CONFIG["CAS_STREAM_URL"]],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, env=no_proxy_env(),
         )
         first = next(line for line in probe.stdout.splitlines() if line.strip())
         sw, sh = (int(x) for x in first.strip().split(",")[:2])
@@ -279,7 +284,7 @@ class Watcher(threading.Thread):
         w, h = self.frame_size()
         nbytes = w * h * 3
         log(f"ffmpeg starting: {w}x{h}, one frame every {CONFIG['CAS_INTERVAL']} s")
-        self.proc = subprocess.Popen(self.ffmpeg_cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.proc = subprocess.Popen(self.ffmpeg_cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=no_proxy_env())
         try:
             while not self.stop.is_set():
                 data = self.proc.stdout.read(nbytes)
