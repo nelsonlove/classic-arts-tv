@@ -1,0 +1,20 @@
+[Unit]
+Description=Classic Arts Showcase stream watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=cas
+Group=cas
+EnvironmentFile=-/etc/cas-watcher.env
+ExecStart=/usr/bin/python3 /opt/cas-watcher/cas_watcher.py
+Restart=always
+RestartSec=10
+StateDirectory=cas-watcher
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

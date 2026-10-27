@@ -24,3 +24,16 @@ The playlist URL lives in `Sources/Stream.swift`. To try another playlist withou
 ## Rights
 
 Classic Arts Showcase gives its feed away free, but this app is for personal use. Publishing it on the App Store would need their written agreement first.
+
+## What's playing
+
+Classic Arts Showcase publishes no playlist, and the stream carries no metadata. The only record of a clip is the credit card burned into the picture at its start and end. The `watcher/` service reads those cards: it decodes one frame every 5 seconds, runs tesseract on it, keeps the frames that read like credits, and stores each card once with a thumbnail. It serves a web page and a small JSON API:
+
+- `GET /api/now`: the latest card, if it was seen in the last 15 minutes
+- `GET /api/recent?limit=50`: the latest cards, newest first
+- `GET /thumbs/<id>.jpg`: the frame the card was first read from
+- `GET /health`: frames seen and whether ffmpeg is running
+
+Install it on any Debian or Ubuntu host with `sudo sh watcher/install.sh` from the `watcher/` folder; settings go in `/etc/cas-watcher.env` (see `cas-watcher.env.example`). It needs about 5% of one CPU thread, under 250 MB of memory, and the stream's bandwidth around the clock: about 13 GB a day at 360p, 18 GB at 480p (set `CAS_STREAM_URL` to the 480p playlist for cleaner reads of names).
+
+The app polls the watcher every 30 seconds, shows a banner when a new card is read, and lists what played: on iPhone and iPad behind the list button, on Apple TV as a tab in the player's Info panel (swipe down on the remote). The watcher's address is in `Sources/WatcherClient.swift`; override it in UserDefaults under `watcherURL`.
