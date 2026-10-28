@@ -4,18 +4,32 @@ import SwiftUI
 struct RecentListView: View {
     @ObservedObject var client: WatcherClient
 
+    /// The card to show as now playing: the watcher's own answer, else the latest card it has.
+    private var current: Card? { client.now ?? client.recent.first }
+
     var body: some View {
         List {
-            if let now = client.now {
-                Section("Now playing") { CardRow(card: now, client: client) }
-            }
-            Section(client.now == nil ? "Recently played" : "Before that") {
-                if client.recent.isEmpty {
+            Section {
+                if let current {
+                    CardRow(card: current, client: client, showsAge: true)
+                } else {
                     Text(client.reachable ? "Nothing read yet." : "The watcher is not reachable. Are you on the tailnet?")
                         .foregroundStyle(.secondary)
                 }
-                ForEach(client.recent.filter { $0.id != client.now?.id }) { card in
-                    CardRow(card: card, client: client)
+            } header: {
+                Text("Now playing")
+            } footer: {
+                if client.now == nil, current != nil {
+                    Text("The last credits the watcher read. Credits show at the start and end of each clip.")
+                }
+            }
+            Section("Recently played") {
+                let rest = client.recent.filter { $0.id != current?.id }
+                if rest.isEmpty {
+                    Text("Nothing else yet.").foregroundStyle(.secondary)
+                }
+                ForEach(rest) { card in
+                    CardRow(card: card, client: client, showsAge: false)
                 }
             }
         }
@@ -26,6 +40,7 @@ struct RecentListView: View {
 struct CardRow: View {
     let card: Card
     let client: WatcherClient
+    var showsAge = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -40,7 +55,7 @@ struct CardRow: View {
                 Text(card.text)
                     .font(.body)
                 if let when = card.when {
-                    Text(when.formatted(date: .abbreviated, time: .shortened))
+                    Text(showsAge ? "Read \(when.formatted(.relative(presentation: .named)))" : when.formatted(date: .abbreviated, time: .shortened))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

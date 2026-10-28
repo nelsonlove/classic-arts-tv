@@ -51,7 +51,7 @@ struct PlayerScreen: View {
         .sheet(isPresented: $showList) {
             NavigationStack {
                 RecentListView(client: client)
-                    .navigationTitle("Recently played")
+                    .navigationTitle("What's playing")
                     .toolbar { Button("Done") { showList = false } }
             }
         }
@@ -112,7 +112,7 @@ struct TVPlayerView: UIViewControllerRepresentable {
         let controller = AVPlayerViewController()
         controller.player = player
         let info = UIHostingController(rootView: RecentListView(client: client))
-        info.title = "Recently played"
+        info.title = "What's playing"
         info.preferredContentSize = CGSize(width: 1920, height: 560)
         controller.customInfoViewControllers = [info]
         return controller
