@@ -35,7 +35,7 @@ final class WatcherClient: ObservableObject {
     @Published private(set) var reachable = true
 
     /// The watcher's base URL. Override it in UserDefaults under `watcherURL` without a rebuild.
-    static let defaultBase = URL(string: "https://host.example.com/classicarts")!
+    static let defaultBase = URL(string: "https://watcher.example.com")!
     static let overrideKey = "watcherURL"
 
     var base: URL {
