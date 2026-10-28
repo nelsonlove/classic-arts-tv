@@ -20,9 +20,11 @@ final class PlayerModel: ObservableObject {
     init() {
         player.allowsExternalPlayback = true
         player.automaticallyWaitsToMinimizeStalling = true
+        #if os(iOS) || os(tvOS)
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .moviePlayback)
         try? session.setActive(true)
+        #endif
         load()
     }
 

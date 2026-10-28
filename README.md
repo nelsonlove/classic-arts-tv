@@ -1,6 +1,6 @@
 # Classic Arts TV
 
-An iPhone, iPad and Apple TV app that plays the Classic Arts Showcase live stream, full screen, with nothing else on it. Classic Arts Showcase is a free, non-commercial 24-hour arts channel; its own web player serves a public HLS playlist, and this app plays that playlist in the native player, so AirPlay, the lock screen controls and the Apple TV remote all work as they do for any other video.
+An iPhone, iPad, Apple TV and Mac app that plays the Classic Arts Showcase live stream, full screen, with nothing else on it. Classic Arts Showcase is a free, non-commercial 24-hour arts channel; its own web player serves a public HLS playlist, and this app plays that playlist in the native player, so AirPlay, the lock screen controls and the Apple TV remote all work as they do for any other video.
 
 ## Build
 
@@ -11,7 +11,12 @@ xcodegen generate
 open ClassicArts.xcodeproj
 ```
 
-In Xcode, pick the `ClassicArts` scheme, pick your iPhone or Apple TV as the destination, and press Run. The first run on a device asks you to sign in with your Apple ID under Signing & Capabilities if Xcode does not already know it.
+In Xcode, pick the `ClassicArts` scheme, pick your iPhone, Apple TV or Mac as the destination, and press Run. On the Mac the player has Picture in Picture and a full-screen button in its controls. A Mac build needs no Apple account at all when it is signed to run locally:
+
+```sh
+xcodebuild -project ClassicArts.xcodeproj -scheme ClassicArts -destination 'platform=macOS' -derivedDataPath build/dd build CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=
+open build/dd/Build/Products/Debug/ClassicArts.app
+``` The first run on a device asks you to sign in with your Apple ID under Signing & Capabilities if Xcode does not already know it.
 
 An Apple TV is paired from the Apple TV side: Settings > Remotes and Devices > Remote App and Devices, then it appears in Xcode > Window > Devices and Simulators.
 

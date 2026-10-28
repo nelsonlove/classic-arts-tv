@@ -4,6 +4,7 @@ options:
   deploymentTarget:
     iOS: "17.0"
     tvOS: "17.0"
+    macOS: "14.0"
   createIntermediateGroups: true
 settings:
   base:
@@ -15,7 +16,7 @@ settings:
 targets:
   ClassicArts:
     type: application
-    supportedDestinations: [iOS, tvOS]
+    supportedDestinations: [iOS, tvOS, macOS]
     sources: [Sources]
     info:
       path: Sources/Info.plist
@@ -26,6 +27,7 @@ targets:
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         ITSAppUsesNonExemptEncryption: false
+        LSApplicationCategoryType: public.app-category.entertainment
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: love.nelson.classicarts

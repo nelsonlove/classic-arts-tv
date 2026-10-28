@@ -6,5 +6,8 @@ struct ClassicArtsApp: App {
         WindowGroup {
             PlayerScreen()
         }
+        #if os(macOS)
+        .defaultSize(width: 960, height: 540)
+        #endif
     }
 }

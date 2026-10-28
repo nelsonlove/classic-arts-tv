@@ -36,6 +36,8 @@ struct PlayerScreen: View {
         #if os(iOS)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        #endif
+        #if os(iOS) || os(macOS)
         .overlay(alignment: .bottomTrailing) {
             Button { showList = true } label: {
                 Image(systemName: "list.bullet")
@@ -60,6 +62,8 @@ struct PlayerScreen: View {
     private var player: some View {
         #if os(tvOS)
         TVPlayerView(player: model.player, client: client)
+        #elseif os(macOS)
+        MacPlayerView(player: model.player)
         #else
         VideoPlayer(player: model.player)
         #endif
@@ -115,5 +119,23 @@ struct TVPlayerView: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {}
+}
+#endif
+
+#if os(macOS)
+/// The AppKit player, with Picture in Picture and the full-screen button in its controls.
+struct MacPlayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        view.controlsStyle = .floating
+        view.allowsPictureInPicturePlayback = true
+        view.showsFullScreenToggleButton = true
+        return view
+    }
+
+    func updateNSView(_ view: AVPlayerView, context: Context) {}
 }
 #endif
