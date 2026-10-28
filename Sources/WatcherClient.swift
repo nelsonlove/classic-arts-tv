@@ -13,9 +13,10 @@ struct Card: Identifiable, Decodable, Equatable {
     let urls: [String]?
     let entities: [Entity]?
     let search: [String: String]?
+    let links: [LinkItem]?
 
     enum CodingKeys: String, CodingKey {
-        case id, lines, thumb, category, urls, entities, search
+        case id, lines, thumb, category, urls, entities, search, links
         case cleanLines = "clean_lines"
         case firstSeen = "first_seen"
         case lastSeen = "last_seen"
@@ -31,18 +32,14 @@ struct Card: Identifiable, Decodable, Equatable {
         var id: String { kind + ":" + name }
     }
 
-    /// Everything the card links to: Wikipedia pages, printed web addresses, then search links.
-    var links: [(label: String, url: URL, sure: Bool)] {
-        var out: [(String, URL, Bool)] = []
-        for e in entities ?? [] {
-            if e.sure == true, let w = e.wikipedia, let u = URL(string: w) { out.append((e.name, u, true)) }
-        }
-        for s in urls ?? [] {
-            if let u = URL(string: s) { out.append((u.host ?? s, u, true)) }
-        }
-        if let y = search?["youtube"], let u = URL(string: y) { out.append(("YouTube", u, true)) }
-        if let a = search?["apple_music"], let u = URL(string: a) { out.append(("Apple Music", u, true)) }
-        return out
+    /// One link as the watcher lists them: a sure Wikipedia page, a printed web address, or a search link.
+    struct LinkItem: Decodable, Equatable, Identifiable {
+        let label: String
+        let url: String
+        let kind: String
+        let note: String?
+        var id: String { url }
+        var destination: URL? { URL(string: url) }
     }
 
     /// The model-corrected reading when the watcher has one, else the raw OCR.

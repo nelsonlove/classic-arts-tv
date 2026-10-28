@@ -204,6 +204,7 @@ def row_to_dict(r: sqlite3.Row) -> dict:
         "urls": [normalise_url(u) for u in urls],
         "entities": entities_of(clean),
         "search": search_links(clean, shown),
+        "links": links_of(entities_of(clean), [normalise_url(u) for u in urls], search_links(clean, shown)),
         "thumb": f"{CONFIG['CAS_PATH_PREFIX']}/thumbs/{r['id']}.jpg?v={version}",
     }
 
@@ -222,7 +223,15 @@ def normalise_url(u: str) -> str:
 def search_links(clean: dict | None, shown: list[str]) -> dict:
     """Search links that never lie: the title and performers as a query, where a direct link would be a guess."""
     c = clean or {}
-    parts = [c.get("title") or (shown[0] if shown else ""), c.get("composer") or "", c.get("performers") or ""]
+
+    def text(v) -> str:  # the model may answer with a list where a string was asked for
+        if isinstance(v, str):
+            return v
+        if isinstance(v, list):
+            return " ".join(str(x) for x in v)
+        return ""
+
+    parts = [text(c.get("title")) or (shown[0] if shown else ""), text(c.get("composer")), text(c.get("performers"))]
     q = " ".join(p for p in parts if p).strip()
     if not q:
         return {}
@@ -230,6 +239,14 @@ def search_links(clean: dict | None, shown: list[str]) -> dict:
         "youtube": "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q),
         "apple_music": "https://music.apple.com/search?term=" + urllib.parse.quote_plus(q),
     }
+
+
+def links_of(entities: list[dict], urls: list[str], search: dict) -> list[dict]:
+    """The one list both front ends show: sure Wikipedia pages, the printed addresses, then the search links."""
+    out = [{"label": e["name"], "url": e["wikipedia"], "kind": "wikipedia", "note": e.get("summary") or ""} for e in entities if e.get("wikipedia") and e.get("sure")]
+    out += [{"label": u.split("//", 1)[-1].rstrip("/"), "url": u, "kind": "site", "note": ""} for u in urls]
+    out += [{"label": label, "url": search[key], "kind": "search", "note": ""} for key, label in (("youtube", "YouTube"), ("apple_music", "Apple Music")) if key in search]
+    return out
 
 
 WIKI_CACHE: dict[tuple[str, str], dict] = {}
@@ -258,18 +275,33 @@ WIKI_WORDS = {
 }
 
 
+WIKI_RETRY = 86400  # a lookup that found nothing, or failed, is tried again after a day
+
+
 def wiki_lookup(con: sqlite3.Connection, lock: threading.Lock, name: str, kind: str) -> dict | None:
-    """Look a name up on Wikipedia once; keep the page, its first sentence, and whether the sentence fits the kind."""
+    """Look a name up on Wikipedia once; keep the page, its first sentence, and whether the sentence fits the kind.
+    One lookup at a time across threads, which also keeps to Wikimedia's one request a second."""
     key = (name, kind)
-    if key in WIKI_CACHE:
-        return WIKI_CACHE[key]
-    with lock:
-        row = con.execute("SELECT title, url, summary, sure FROM wiki WHERE name=? AND kind=?", key).fetchone()
-    if row is not None:
-        WIKI_CACHE[key] = dict(row)
-        return WIKI_CACHE[key]
-    if not CONFIG["CAS_WIKI_LANG"]:
-        return None
+    with WIKI_LOCK:
+        hit = WIKI_CACHE.get(key)
+        if hit is not None and (hit.get("url") or time.time() - hit.get("at", 0) < WIKI_RETRY):
+            return hit
+        if not CONFIG["CAS_WIKI_LANG"]:
+            return None
+        result = _wiki_fetch(name, kind)
+        if result is None:  # a network failure: remember the time so it is not retried at once
+            result = {"title": None, "url": None, "summary": None, "sure": 0}
+        result["at"] = time.time()
+        with lock:
+            con.execute("INSERT OR REPLACE INTO wiki(name, kind, looked_up, title, url, summary, sure) VALUES (?,?,?,?,?,?,?)",
+                        (name, kind, datetime.now(timezone.utc).isoformat(timespec="seconds"), result["title"], result["url"], result["summary"], result["sure"]))
+            con.commit()
+        WIKI_CACHE[key] = result
+        time.sleep(1.0)
+        return result
+
+
+def _wiki_fetch(name: str, kind: str) -> dict | None:
     lang = CONFIG["CAS_WIKI_LANG"]
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # Wikipedia is reached directly, never through a proxy set for the model
     headers = {"User-Agent": f"cas-watcher/1.0 ({CONFIG['CAS_WIKI_CONTACT']})", "Accept": "application/json"}
@@ -294,27 +326,35 @@ def wiki_lookup(con: sqlite3.Connection, lock: threading.Lock, name: str, kind: 
     except Exception as e:  # noqa: BLE001
         log(f"wikipedia lookup failed for {name!r}: {e!r}")
         return None
-    with lock:
-        con.execute("INSERT OR REPLACE INTO wiki(name, kind, looked_up, title, url, summary, sure) VALUES (?,?,?,?,?,?,?)",
-                    (name, kind, datetime.now(timezone.utc).isoformat(timespec="seconds"), result["title"], result["url"], result["summary"], result["sure"]))
-        con.commit()
-    WIKI_CACHE[key] = result
     return result
 
 
+ALL_WORDS = "|".join(WIKI_WORDS.values())
+
+
 def wiki_sure(name: str, kind: str, title: str | None, summary: str | None) -> int:
-    """A match is sure when the page's first sentence fits the kind and the page title is the name."""
+    """A match is sure when the page's first sentence fits the kind and the page title is the name.
+    A work may carry its composer in the name ("Tchaikovsky: Swan Lake"), so the part after the colon counts too.
+    A kind the table does not know gets no benefit of the doubt: an arts word in the sentence and a near-exact title."""
     if not title or not summary:
         return 0
-    words = re.compile(WIKI_WORDS.get(kind, "."), re.I)
-    return int(bool(words.search(summary)) and similar(title.split(" (")[0], name) >= 0.6)
+    known = kind in WIKI_WORDS
+    words = re.compile(WIKI_WORDS[kind] if known else ALL_WORDS, re.I)
+    page = title.split(" (")[0]
+    candidates = [name] + ([name.split(":", 1)[1].strip()] if ":" in name else [])
+    score = max(similar(page, c) for c in candidates)
+    return int(bool(words.search(summary)) and score >= (0.6 if known else 0.9))
 
 
 def load_wiki_cache(con: sqlite3.Connection):
     """Load the lookups made before, judging each again with the current rule."""
-    for row in con.execute("SELECT name, kind, title, url, summary FROM wiki").fetchall():
+    for row in con.execute("SELECT name, kind, looked_up, title, url, summary FROM wiki").fetchall():
+        try:
+            at = datetime.fromisoformat(row["looked_up"]).timestamp()
+        except ValueError:
+            at = 0
         WIKI_CACHE[(row["name"], row["kind"])] = {"title": row["title"], "url": row["url"], "summary": row["summary"],
-                                                  "sure": wiki_sure(row["name"], row["kind"], row["title"], row["summary"])}
+                                                  "sure": wiki_sure(row["name"], row["kind"], row["title"], row["summary"]), "at": at}
 
 
 def display_lines(c: dict) -> list[str]:
@@ -415,6 +455,16 @@ class Corrector:
             if thumb.exists():
                 self._run(r["id"], json.loads(r["lines"]), Image.open(thumb).convert("RGB"))
                 time.sleep(2.0)
+        self.wiki_sweep()
+
+    def wiki_sweep(self):
+        """Look up every name on every card that has no page yet and is due a try."""
+        with self.lock:
+            rows = self.con.execute("SELECT clean FROM cards WHERE clean IS NOT NULL ORDER BY id DESC LIMIT 500").fetchall()
+        for r in rows:
+            for e in (json.loads(r["clean"]) or {}).get("entities") or []:
+                if isinstance(e, dict) and str(e.get("name") or "").strip():
+                    wiki_lookup(self.con, self.lock, str(e["name"]).strip(), str(e.get("kind") or "other").strip().lower())
 
     def _run(self, card_id: int, lines: list[str], image: Image.Image):
         for attempt in (1, 2):
@@ -432,7 +482,6 @@ class Corrector:
                 for e in clean.get("entities") or []:
                     if isinstance(e, dict) and str(e.get("name") or "").strip():
                         wiki_lookup(self.con, self.lock, str(e["name"]).strip(), str(e.get("kind") or "other").strip().lower())
-                        time.sleep(1.0)  # one request a second is Wikimedia's ask
                 return
             except (anthropic.APIConnectionError, anthropic.RateLimitError, anthropic.InternalServerError) as e:
                 log(f"card #{card_id} correction attempt {attempt} failed, will retry: {e!r}")
@@ -470,6 +519,8 @@ class Corrector:
         if not isinstance(clean, dict) or not isinstance(clean.get("lines"), list):
             raise ValueError(f"the reply is not the expected JSON object: {text[:200]!r}")
         clean["lines"] = [str(x).strip() for x in clean["lines"] if str(x).strip()]
+        clean.setdefault("entities", [])
+        clean.setdefault("urls", [])
         clean["model"] = CONFIG["CAS_LLM_MODEL"]
         return clean
 
@@ -649,16 +700,7 @@ def fmt_card(c: dict, cls: str = "") -> str:
     esc = lambda x: str(x).replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
     text = esc("\n".join(display_lines(c)))
     cat = f'{esc(c["category"])} · ' if c.get("category") else ""
-    links = []
-    for e in c.get("entities") or []:
-        if e.get("wikipedia") and e.get("sure"):
-            links.append(f'<a href="{esc(e["wikipedia"])}" title="{esc(e.get("summary") or "")}">{esc(e["name"])}</a>')
-    for u in c.get("urls") or []:
-        links.append(f'<a href="{esc(u)}">{esc(u.split("//", 1)[-1].rstrip("/"))}</a>')
-    s = c.get("search") or {}
-    if s:
-        links.append(f'<a href="{esc(s["youtube"])}">YouTube</a>')
-        links.append(f'<a href="{esc(s["apple_music"])}">Apple Music</a>')
+    links = [f'<a href="{esc(l["url"])}" title="{esc(l["note"])}">{esc(l["label"])}</a>' for l in c.get("links") or []]
     linkrow = f'<div class="links">{" · ".join(links)}</div>' if links else ""
     return f'<div class="card {cls}"><img src="{c["thumb"]}" alt=""><div><div class="t">{text}</div>{linkrow}<time>{cat}{when}</time></div></div>'
 

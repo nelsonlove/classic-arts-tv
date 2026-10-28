@@ -55,8 +55,8 @@ struct CardRow: View {
                 Text(card.text)
                     .font(.body)
                 #if !os(tvOS)
-                if !card.links.isEmpty {
-                    FlowLinks(links: card.links)
+                if let links = card.links, !links.isEmpty {
+                    FlowLinks(links: links)
                 }
                 #endif
                 if let when = card.when {
@@ -80,18 +80,19 @@ struct CardRow: View {
 }
 
 #if !os(tvOS)
-/// The card's links in a wrapping row; a doubtful Wikipedia match is shown dimmer.
+/// The card's links in a wrapping row.
 struct FlowLinks: View {
-    let links: [(label: String, url: URL, sure: Bool)]
+    let links: [Card.LinkItem]
 
     var body: some View {
-        // A simple wrap: LazyVGrid with adaptive columns keeps it readable on narrow phones.
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), alignment: .leading)], alignment: .leading, spacing: 4) {
-            ForEach(Array(links.enumerated()), id: \.offset) { _, link in
-                Link(link.label, destination: link.url)
-                    .font(.caption)
-                    .opacity(link.sure ? 1 : 0.6)
-                    .lineLimit(1)
+            ForEach(links) { link in
+                if let url = link.destination {
+                    Link(link.label, destination: url)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .help(link.note ?? "")
+                }
             }
         }
     }

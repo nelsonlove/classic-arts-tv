@@ -4,7 +4,7 @@ An iPhone, iPad, Apple TV and Mac app that plays the Classic Arts Showcase strea
 
 ## Merge rule
 
-Nelson, 2026-10-28, in the session that built this repository: "merge em. you have standing permission to merge". So in this repository the session that owns the work merges its own PR once the PR's independent review has closed with no serious finding, pinned to the reviewed head sha, and tells him after. His word is not needed per PR. A release, a change that spends money, a change to this rule, and anything that sends his data outside still wait for his word.
+Nelson, 2026-10-28, in the session that built this repository: "merge em. you have standing permission to merge". So in this repository the session that owns the work merges its own PR once the PR's independent review has closed with no serious finding, pinned to the reviewed head sha, and tells him after. His word is not needed per PR. A release, a change that spends money, a change to this rule, and anything that sends his data outside still wait for his word. This is looser than the fleet's tiered merge rule for a public repository, which today lets a repository rule win only where it is stricter; it stands on his words above, and the fleet rule needs this repository named as his exception (told to the CC lead on 2026-10-28).
 
 ## Rules of the house
 
