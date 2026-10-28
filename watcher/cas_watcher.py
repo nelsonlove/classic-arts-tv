@@ -118,6 +118,25 @@ def wordy(line: str) -> bool:
     return True
 
 
+# The channel's category label, shown small in the top-left corner at the start of a clip: "recital", "ballet", "music video".
+CATEGORIES = {
+    "music video", "classic film", "ballet", "soloist/orchestral", "solo instrumental", "solo vocal", "recital", "film short",
+    "opera", "orchestral", "musical short", "musical theater", "musical theatre", "animation", "choral", "documentary", "dance",
+    "modern dance", "chamber music", "jazz", "operetta", "concert", "visual arts", "architecture", "interview", "classic", "film",
+}
+CATEGORY_SHAPE = re.compile(r"^[a-z][a-z /&-]{2,27}$")
+
+
+def split_category(lines: list[str]) -> tuple[str | None, list[str]]:
+    """Take the category label off the front of a card's lines, if the first line is one."""
+    if not lines:
+        return None, lines
+    first = lines[0].strip().rstrip(":").strip()
+    if first in CATEGORIES or (CATEGORY_SHAPE.match(first) and len(first.split()) <= 3 and first.lower() == first):
+        return first, lines[1:]
+    return None, lines
+
+
 def card_lines(lines: list[str]) -> list[str]:
     kept = [ln for ln in lines if wordy(ln)]
     if len(kept) < CONFIG["CAS_MIN_LINES"]:
@@ -143,7 +162,7 @@ def db() -> sqlite3.Connection:
         lines TEXT NOT NULL
     )""")
     con.execute("CREATE INDEX IF NOT EXISTS cards_last_seen ON cards(last_seen)")
-    for column in ("clean TEXT", "kind TEXT NOT NULL DEFAULT 'clip'"):
+    for column in ("clean TEXT", "kind TEXT NOT NULL DEFAULT 'clip'", "category TEXT"):
         try:
             con.execute(f"ALTER TABLE cards ADD COLUMN {column}")
         except sqlite3.OperationalError:
@@ -155,16 +174,22 @@ def db() -> sqlite3.Connection:
 
 def row_to_dict(r: sqlite3.Row) -> dict:
     clean = json.loads(r["clean"]) if r["clean"] else None
+    ocr_category, lines = split_category(json.loads(r["lines"]))
+    clean_category, clean_lines = split_category((clean or {}).get("lines") or [])
+    category = r["category"] or (clean or {}).get("category") or clean_category or ocr_category
+    thumb = THUMBS / f"{r['id']}.jpg"
+    version = int(thumb.stat().st_mtime) if thumb.exists() else 0
     return {
         "id": r["id"],
         "first_seen": r["first_seen"],
         "last_seen": r["last_seen"],
         "frames": r["frames"],
         "kind": r["kind"],
-        "lines": json.loads(r["lines"]),
+        "category": category or None,
+        "lines": lines,
         "clean": clean,
-        "clean_lines": (clean or {}).get("lines") or [],
-        "thumb": f"{CONFIG['CAS_PATH_PREFIX']}/thumbs/{r['id']}.jpg",
+        "clean_lines": clean_lines,
+        "thumb": f"{CONFIG['CAS_PATH_PREFIX']}/thumbs/{r['id']}.jpg?v={version}",
     }
 
 
@@ -209,9 +234,16 @@ def merge_duplicates(con: sqlite3.Connection, window: int = 1800) -> dict[int, i
 
 # ---------- correction by a model that sees the frame ----------
 
-CORRECT_SYSTEM = """You correct OCR of the credit card that the Classic Arts Showcase TV channel shows at the start and end of each clip. You get the OCR lines and the frame they were read from. Return only a JSON object, no prose and no code fence:
-{"lines": [...], "title": "", "composer": "", "performers": "", "label": ""}
-"lines" is the card's text, one entry per line as printed on the card, in the card's order, with misread characters fixed from the image and OCR noise lines dropped. Keep the card's own wording, including quotes and dates. Do not add lines the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it. The frame may be small or the card partly cut off or fading: return the lines you can read, and when the frame shows no credit text at all return {"lines": []}. Always answer with the JSON object only."""
+# The whole ask goes in the user turn, with the image, so it reaches the model intact even through a gateway that rewrites or drops the system prompt.
+CORRECT_ASK = """This frame is from the Classic Arts Showcase TV channel, which shows a credit card at the start and end of each clip (title, composer, performers, label). My OCR read the lines between the ocr tags from it; they may have mistakes.
+
+<ocr>
+{ocr}
+</ocr>
+
+Please read the card in the image and give me the corrected text as one JSON object and nothing else, no prose, no code fence:
+{{"category": "", "lines": [...], "title": "", "composer": "", "performers": "", "label": ""}}
+"lines" is the card's text, one entry per line as printed, in the card's order, with the misread characters fixed from the image and the OCR noise lines dropped. A small lowercase label in the top-left corner of the picture, such as "recital", "ballet" or "music video", is the channel's category for the clip: put it in "category" and never in "lines". Keep the card's own wording, including quotes and dates, and add no line the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it. The frame may be small, or the card cut off or fading: give the lines you can read, and if the frame shows no credit text at all answer {{"lines": []}}."""
 
 
 def parse_reply(text: str) -> dict:
@@ -263,8 +295,10 @@ class Corrector:
         for attempt in (1, 2):
             try:
                 clean = self._ask(lines, image)
+                category, _ = split_category(clean.get("lines") or [])
+                category = (clean.get("category") or "").strip().lower() or category
                 with self.lock:
-                    self.con.execute("UPDATE cards SET clean=? WHERE id=?", (json.dumps(clean), card_id))
+                    self.con.execute("UPDATE cards SET clean=?, category=COALESCE(?, category) WHERE id=?", (json.dumps(clean), category, card_id))
                     self.con.commit()
                     merged = merge_duplicates(self.con)
                 log(f"card #{card_id} corrected: " + " | ".join(clean.get("lines") or []))
@@ -290,12 +324,11 @@ class Corrector:
             max_tokens=4096,
             thinking={"type": "disabled"},  # a transcription task; thinking tokens would count against max_tokens
             output_config={"effort": CONFIG["CAS_LLM_EFFORT"]},
-            system=CORRECT_SYSTEM,
             messages=[{
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}},
-                    {"type": "text", "text": "OCR lines:\n" + "\n".join(lines)},
+                    {"type": "text", "text": CORRECT_ASK.format(ocr="\n".join(lines) or "(no lines)")},
                 ],
             }],
         )
@@ -412,9 +445,10 @@ class Watcher(threading.Thread):
         if count >= CONFIG["CAS_MIN_FRAMES"]:
             text, lines, first_image, _ = self.pending
             with self.lock:
+                category, _ = split_category(lines)
                 cur = self.con.execute(
-                    "INSERT INTO cards(first_seen, last_seen, frames, text, lines, kind) VALUES (?,?,?,?,?,?)",
-                    (now, now, count, text, json.dumps(lines), card_kind(lines)),
+                    "INSERT INTO cards(first_seen, last_seen, frames, text, lines, kind, category) VALUES (?,?,?,?,?,?,?)",
+                    (now, now, count, text, json.dumps(lines), card_kind(lines), category),
                 )
                 self.con.commit()
                 self.current_id = cur.lastrowid
@@ -484,7 +518,8 @@ def render(template: str) -> str:
 def fmt_card(c: dict, cls: str = "") -> str:
     when = datetime.fromisoformat(c["first_seen"]).astimezone().strftime("%a %H:%M")
     text = "\n".join(display_lines(c)).replace("&", "&amp;").replace("<", "&lt;")
-    return f'<div class="card {cls}"><img src="{c["thumb"]}" alt=""><div><div class="t">{text}</div><time>{when}</time></div></div>'
+    cat = f'{c["category"]} · ' if c.get("category") else ""
+    return f'<div class="card {cls}"><img src="{c["thumb"]}" alt=""><div><div class="t">{text}</div><time>{cat}{when}</time></div></div>'
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -511,14 +546,14 @@ class Handler(BaseHTTPRequestHandler):
             rows = self.con.execute(f"SELECT * FROM cards {where} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [row_to_dict(r) for r in rows]
 
+    @staticmethod
+    def within_window(card: dict) -> bool:
+        last = datetime.fromisoformat(card["last_seen"])
+        return datetime.now(timezone.utc) - last <= timedelta(seconds=CONFIG["CAS_NOW_WINDOW"])
+
     def now_playing(self):
         cards = self.recent(1)
-        if not cards:
-            return None
-        last = datetime.fromisoformat(cards[0]["last_seen"])
-        if datetime.now(timezone.utc) - last > timedelta(seconds=CONFIG["CAS_NOW_WINDOW"]):
-            return None
-        return cards[0]
+        return cards[0] if cards and self.within_window(cards[0]) else None
 
     def do_GET(self):
         url = urlparse(self.path)
@@ -545,9 +580,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/about":
             return self.send(200, render(ABOUT).encode(), "text/html; charset=utf-8")
         if path == "/":
-            now = self.now_playing()
-            page = render(PAGE).replace("__NOW__", fmt_card(now, "now") if now else '<div class="empty">Between credits; the last card is below.</div>')
-            page = page.replace("__RECENT__", "".join(fmt_card(c) for c in self.recent(50)) or '<div class="empty">Nothing read yet.</div>')
+            # One query: the latest card is the current one (as in the app), the rest is the history.
+            cards = self.recent(51)
+            current, rest = (cards[0], cards[1:]) if cards else (None, [])
+            if current:
+                note = "" if self.within_window(current) else '<div class="empty">The last credits read; the next card comes at the end of the clip.</div>'
+                now_html = fmt_card(current, "now") + note
+            else:
+                now_html = '<div class="empty">Nothing read yet.</div>'
+            page = render(PAGE).replace("__NOW__", now_html)
+            page = page.replace("__RECENT__", "".join(fmt_card(c) for c in rest) or '<div class="empty">Nothing else yet.</div>')
             return self.send(200, page.encode(), "text/html; charset=utf-8")
         self.send(404, b"not found", "text/plain")
 

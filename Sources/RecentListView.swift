@@ -55,7 +55,8 @@ struct CardRow: View {
                 Text(card.text)
                     .font(.body)
                 if let when = card.when {
-                    Text(showsAge ? "Read \(when.formatted(.relative(presentation: .named)))" : when.formatted(date: .abbreviated, time: .shortened))
+                    let stamp = showsAge ? "Read \(when.formatted(.relative(presentation: .named)))" : when.formatted(date: .abbreviated, time: .shortened)
+                    Text(card.category.map { "\($0) · \(stamp)" } ?? stamp)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
