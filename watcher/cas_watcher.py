@@ -210,9 +210,11 @@ def merge_duplicates(con: sqlite3.Connection, window: int = 1800) -> dict[int, i
 # ---------- correction by a model that sees the frame ----------
 
 # The whole ask goes in the user turn, with the image, so it reaches the model intact even through a gateway that rewrites or drops the system prompt.
-CORRECT_ASK = """This frame is from the Classic Arts Showcase TV channel, which shows a credit card at the start and end of each clip (title, composer, performers, label). My OCR read these lines from it, with mistakes:
+CORRECT_ASK = """This frame is from the Classic Arts Showcase TV channel, which shows a credit card at the start and end of each clip (title, composer, performers, label). My OCR read the lines between the ocr tags from it; they may have mistakes.
 
+<ocr>
 {ocr}
+</ocr>
 
 Please read the card in the image and give me the corrected text as one JSON object and nothing else, no prose, no code fence:
 {{"lines": [...], "title": "", "composer": "", "performers": "", "label": ""}}
@@ -299,7 +301,7 @@ class Corrector:
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}},
-                    {"type": "text", "text": CORRECT_ASK.format(ocr="\n".join(lines))},
+                    {"type": "text", "text": CORRECT_ASK.format(ocr="\n".join(lines) or "(no lines)")},
                 ],
             }],
         )
@@ -515,14 +517,14 @@ class Handler(BaseHTTPRequestHandler):
             rows = self.con.execute(f"SELECT * FROM cards {where} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [row_to_dict(r) for r in rows]
 
+    @staticmethod
+    def within_window(card: dict) -> bool:
+        last = datetime.fromisoformat(card["last_seen"])
+        return datetime.now(timezone.utc) - last <= timedelta(seconds=CONFIG["CAS_NOW_WINDOW"])
+
     def now_playing(self):
         cards = self.recent(1)
-        if not cards:
-            return None
-        last = datetime.fromisoformat(cards[0]["last_seen"])
-        if datetime.now(timezone.utc) - last > timedelta(seconds=CONFIG["CAS_NOW_WINDOW"]):
-            return None
-        return cards[0]
+        return cards[0] if cards and self.within_window(cards[0]) else None
 
     def do_GET(self):
         url = urlparse(self.path)
@@ -549,10 +551,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/about":
             return self.send(200, render(ABOUT).encode(), "text/html; charset=utf-8")
         if path == "/":
-            now = self.now_playing()
-            page = render(PAGE).replace("__NOW__", fmt_card(now, "now") if now else '<div class="empty">Between credits; the last card is below.</div>')
-            rest = [c for c in self.recent(51) if not now or c["id"] != now["id"]][:50]
-            page = page.replace("__RECENT__", "".join(fmt_card(c) for c in rest) or '<div class="empty">Nothing read yet.</div>')
+            # One query: the latest card is the current one (as in the app), the rest is the history.
+            cards = self.recent(51)
+            current, rest = (cards[0], cards[1:]) if cards else (None, [])
+            if current:
+                note = "" if self.within_window(current) else '<div class="empty">The last credits read; the next card comes at the end of the clip.</div>'
+                now_html = fmt_card(current, "now") + note
+            else:
+                now_html = '<div class="empty">Nothing read yet.</div>'
+            page = render(PAGE).replace("__NOW__", now_html)
+            page = page.replace("__RECENT__", "".join(fmt_card(c) for c in rest) or '<div class="empty">Nothing else yet.</div>')
             return self.send(200, page.encode(), "text/html; charset=utf-8")
         self.send(404, b"not found", "text/plain")
 
