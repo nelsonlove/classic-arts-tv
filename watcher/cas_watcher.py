@@ -118,6 +118,25 @@ def wordy(line: str) -> bool:
     return True
 
 
+# The channel's category label, shown small in the top-left corner at the start of a clip: "recital", "ballet", "music video".
+CATEGORIES = {
+    "music video", "classic film", "ballet", "soloist/orchestral", "solo instrumental", "solo vocal", "recital", "film short",
+    "opera", "orchestral", "musical short", "musical theater", "musical theatre", "animation", "choral", "documentary", "dance",
+    "modern dance", "chamber music", "jazz", "operetta", "concert", "visual arts", "architecture", "interview", "classic", "film",
+}
+CATEGORY_SHAPE = re.compile(r"^[a-z][a-z /&-]{2,27}$")
+
+
+def split_category(lines: list[str]) -> tuple[str | None, list[str]]:
+    """Take the category label off the front of a card's lines, if the first line is one."""
+    if not lines:
+        return None, lines
+    first = lines[0].strip().rstrip(":").strip()
+    if first in CATEGORIES or (CATEGORY_SHAPE.match(first) and len(first.split()) <= 3 and first.lower() == first):
+        return first, lines[1:]
+    return None, lines
+
+
 def card_lines(lines: list[str]) -> list[str]:
     kept = [ln for ln in lines if wordy(ln)]
     if len(kept) < CONFIG["CAS_MIN_LINES"]:
@@ -143,7 +162,7 @@ def db() -> sqlite3.Connection:
         lines TEXT NOT NULL
     )""")
     con.execute("CREATE INDEX IF NOT EXISTS cards_last_seen ON cards(last_seen)")
-    for column in ("clean TEXT", "kind TEXT NOT NULL DEFAULT 'clip'"):
+    for column in ("clean TEXT", "kind TEXT NOT NULL DEFAULT 'clip'", "category TEXT"):
         try:
             con.execute(f"ALTER TABLE cards ADD COLUMN {column}")
         except sqlite3.OperationalError:
@@ -155,16 +174,22 @@ def db() -> sqlite3.Connection:
 
 def row_to_dict(r: sqlite3.Row) -> dict:
     clean = json.loads(r["clean"]) if r["clean"] else None
+    ocr_category, lines = split_category(json.loads(r["lines"]))
+    clean_category, clean_lines = split_category((clean or {}).get("lines") or [])
+    category = r["category"] or (clean or {}).get("category") or clean_category or ocr_category
+    thumb = THUMBS / f"{r['id']}.jpg"
+    version = int(thumb.stat().st_mtime) if thumb.exists() else 0
     return {
         "id": r["id"],
         "first_seen": r["first_seen"],
         "last_seen": r["last_seen"],
         "frames": r["frames"],
         "kind": r["kind"],
-        "lines": json.loads(r["lines"]),
+        "category": category or None,
+        "lines": lines,
         "clean": clean,
-        "clean_lines": (clean or {}).get("lines") or [],
-        "thumb": f"{CONFIG['CAS_PATH_PREFIX']}/thumbs/{r['id']}.jpg",
+        "clean_lines": clean_lines,
+        "thumb": f"{CONFIG['CAS_PATH_PREFIX']}/thumbs/{r['id']}.jpg?v={version}",
     }
 
 
@@ -217,8 +242,8 @@ CORRECT_ASK = """This frame is from the Classic Arts Showcase TV channel, which 
 </ocr>
 
 Please read the card in the image and give me the corrected text as one JSON object and nothing else, no prose, no code fence:
-{{"lines": [...], "title": "", "composer": "", "performers": "", "label": ""}}
-"lines" is the card's text, one entry per line as printed, in the card's order, with the misread characters fixed from the image and the OCR noise lines dropped. Keep the card's own wording, including quotes and dates, and add no line the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it. The frame may be small, or the card cut off or fading: give the lines you can read, and if the frame shows no credit text at all answer {{"lines": []}}."""
+{{"category": "", "lines": [...], "title": "", "composer": "", "performers": "", "label": ""}}
+"lines" is the card's text, one entry per line as printed, in the card's order, with the misread characters fixed from the image and the OCR noise lines dropped. A small lowercase label in the top-left corner of the picture, such as "recital", "ballet" or "music video", is the channel's category for the clip: put it in "category" and never in "lines". Keep the card's own wording, including quotes and dates, and add no line the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it. The frame may be small, or the card cut off or fading: give the lines you can read, and if the frame shows no credit text at all answer {{"lines": []}}."""
 
 
 def parse_reply(text: str) -> dict:
@@ -270,8 +295,10 @@ class Corrector:
         for attempt in (1, 2):
             try:
                 clean = self._ask(lines, image)
+                category, _ = split_category(clean.get("lines") or [])
+                category = (clean.get("category") or "").strip().lower() or category
                 with self.lock:
-                    self.con.execute("UPDATE cards SET clean=? WHERE id=?", (json.dumps(clean), card_id))
+                    self.con.execute("UPDATE cards SET clean=?, category=COALESCE(?, category) WHERE id=?", (json.dumps(clean), category, card_id))
                     self.con.commit()
                     merged = merge_duplicates(self.con)
                 log(f"card #{card_id} corrected: " + " | ".join(clean.get("lines") or []))
@@ -418,9 +445,10 @@ class Watcher(threading.Thread):
         if count >= CONFIG["CAS_MIN_FRAMES"]:
             text, lines, first_image, _ = self.pending
             with self.lock:
+                category, _ = split_category(lines)
                 cur = self.con.execute(
-                    "INSERT INTO cards(first_seen, last_seen, frames, text, lines, kind) VALUES (?,?,?,?,?,?)",
-                    (now, now, count, text, json.dumps(lines), card_kind(lines)),
+                    "INSERT INTO cards(first_seen, last_seen, frames, text, lines, kind, category) VALUES (?,?,?,?,?,?,?)",
+                    (now, now, count, text, json.dumps(lines), card_kind(lines), category),
                 )
                 self.con.commit()
                 self.current_id = cur.lastrowid
@@ -490,7 +518,8 @@ def render(template: str) -> str:
 def fmt_card(c: dict, cls: str = "") -> str:
     when = datetime.fromisoformat(c["first_seen"]).astimezone().strftime("%a %H:%M")
     text = "\n".join(display_lines(c)).replace("&", "&amp;").replace("<", "&lt;")
-    return f'<div class="card {cls}"><img src="{c["thumb"]}" alt=""><div><div class="t">{text}</div><time>{when}</time></div></div>'
+    cat = f'{c["category"]} · ' if c.get("category") else ""
+    return f'<div class="card {cls}"><img src="{c["thumb"]}" alt=""><div><div class="t">{text}</div><time>{cat}{when}</time></div></div>'
 
 
 class Handler(BaseHTTPRequestHandler):

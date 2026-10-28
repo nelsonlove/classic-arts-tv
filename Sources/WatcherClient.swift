@@ -8,10 +8,11 @@ struct Card: Identifiable, Decodable, Equatable {
     let lastSeen: String
     let lines: [String]
     let cleanLines: [String]?
+    let category: String?
     let thumb: String
 
     enum CodingKeys: String, CodingKey {
-        case id, lines, thumb
+        case id, lines, thumb, category
         case cleanLines = "clean_lines"
         case firstSeen = "first_seen"
         case lastSeen = "last_seen"
