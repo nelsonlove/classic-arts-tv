@@ -149,7 +149,7 @@ def display_lines(c: dict) -> list[str]:
 
 CORRECT_SYSTEM = """You correct OCR of the credit card that the Classic Arts Showcase TV channel shows at the start and end of each clip. You get the OCR lines and the frame they were read from. Return only a JSON object, no prose and no code fence:
 {"lines": [...], "title": "", "composer": "", "performers": "", "label": ""}
-"lines" is the card's text, one entry per line as printed on the card, in the card's order, with misread characters fixed from the image and OCR noise lines dropped. Keep the card's own wording, including quotes and dates. Do not add lines the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it."""
+"lines" is the card's text, one entry per line as printed on the card, in the card's order, with misread characters fixed from the image and OCR noise lines dropped. Keep the card's own wording, including quotes and dates. Do not add lines the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it. The frame may be small or the card partly cut off or fading: return the lines you can read, and when the frame shows no credit text at all return {"lines": []}. Always answer with the JSON object only."""
 
 
 def parse_reply(text: str) -> dict:
@@ -221,7 +221,8 @@ class Corrector:
         data = base64.standard_b64encode(buf.getvalue()).decode("ascii")
         response = self.client.messages.create(
             model=CONFIG["CAS_LLM_MODEL"],
-            max_tokens=1024,
+            max_tokens=4096,
+            thinking={"type": "disabled"},  # a transcription task; thinking tokens would count against max_tokens
             output_config={"effort": CONFIG["CAS_LLM_EFFORT"]},
             system=CORRECT_SYSTEM,
             messages=[{
