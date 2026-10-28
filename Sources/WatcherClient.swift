@@ -10,12 +10,23 @@ struct Card: Identifiable, Decodable, Equatable {
     let cleanLines: [String]?
     let category: String?
     let thumb: String
+    let links: [LinkItem]?
 
     enum CodingKeys: String, CodingKey {
-        case id, lines, thumb, category
+        case id, lines, thumb, category, links
         case cleanLines = "clean_lines"
         case firstSeen = "first_seen"
         case lastSeen = "last_seen"
+    }
+
+    /// One link as the watcher lists them: a sure Wikipedia page, a printed web address, or a search link.
+    struct LinkItem: Decodable, Equatable, Identifiable {
+        let label: String
+        let url: String
+        let kind: String
+        let note: String?
+        var id: String { url }
+        var destination: URL? { URL(string: url) }
     }
 
     /// The model-corrected reading when the watcher has one, else the raw OCR.
