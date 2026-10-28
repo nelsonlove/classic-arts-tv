@@ -1,0 +1,5 @@
+// Copy to Local.xcconfig (gitignored). Both lines are optional.
+// Your Apple team for device builds; a free Personal Team works for your own devices.
+DEVELOPMENT_TEAM =
+// Where your watcher answers (see watcher/). Leave empty to run without the now-playing views.
+CAS_WATCHER_URL = https:/$()/watcher.example.com

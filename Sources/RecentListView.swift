@@ -13,7 +13,7 @@ struct RecentListView: View {
                 if let current {
                     CardRow(card: current, client: client, showsAge: true)
                 } else {
-                    Text(client.reachable ? "Nothing read yet." : "The watcher is not reachable. Are you on the tailnet?")
+                    Text(client.base == nil ? "No watcher is set. Put its address in Local.xcconfig or under watcherURL in UserDefaults." : client.reachable ? "Nothing read yet." : "The watcher is not reachable.")
                         .foregroundStyle(.secondary)
                 }
             } header: {

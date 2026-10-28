@@ -34,15 +34,17 @@ final class WatcherClient: ObservableObject {
     @Published private(set) var recent: [Card] = []
     @Published private(set) var reachable = true
 
-    /// The watcher's base URL. Override it in UserDefaults under `watcherURL` without a rebuild.
-    static let defaultBase = URL(string: "https://watcher.example.com")!
+    /// The watcher's base URL: `watcherURL` in UserDefaults wins, else `CASWatcherURL` from Info.plist (set by `CAS_WATCHER_URL` in Local.xcconfig), else none.
     static let overrideKey = "watcherURL"
 
-    var base: URL {
+    var base: URL? {
         if let text = UserDefaults.standard.string(forKey: Self.overrideKey), let url = URL(string: text) {
             return url
         }
-        return Self.defaultBase
+        if let text = Bundle.main.object(forInfoDictionaryKey: "CASWatcherURL") as? String, !text.isEmpty, let url = URL(string: text) {
+            return url
+        }
+        return nil
     }
 
     private var poller: Task<Void, Never>?
@@ -66,6 +68,10 @@ final class WatcherClient: ObservableObject {
     func refresh() async {
         struct NowReply: Decodable { let now: Card? }
         struct RecentReply: Decodable { let cards: [Card] }
+        guard let base else {
+            reachable = false
+            return
+        }
         do {
             async let nowData = URLSession.shared.data(from: base.appending(path: "api/now"))
             async let recentData = URLSession.shared.data(from: base.appending(path: "api/recent").appending(queryItems: [URLQueryItem(name: "limit", value: "50")]))
@@ -80,6 +86,6 @@ final class WatcherClient: ObservableObject {
     }
 
     func thumbURL(_ card: Card) -> URL? {
-        URL(string: card.thumb, relativeTo: base)
+        base.flatMap { URL(string: card.thumb, relativeTo: $0) }
     }
 }

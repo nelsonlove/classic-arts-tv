@@ -6,9 +6,11 @@ options:
     tvOS: "17.0"
     macOS: "14.0"
   createIntermediateGroups: true
+configFiles:
+  Debug: Local.xcconfig
+  Release: Local.xcconfig
 settings:
   base:
-    DEVELOPMENT_TEAM: YOUR_TEAM_ID
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "5.10"
     MARKETING_VERSION: "0.1.0"
@@ -27,6 +29,7 @@ targets:
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         ITSAppUsesNonExemptEncryption: false
+        CASWatcherURL: $(CAS_WATCHER_URL)
         LSApplicationCategoryType: public.app-category.entertainment
     settings:
       base:
