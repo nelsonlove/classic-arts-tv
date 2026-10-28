@@ -209,9 +209,14 @@ def merge_duplicates(con: sqlite3.Connection, window: int = 1800) -> dict[int, i
 
 # ---------- correction by a model that sees the frame ----------
 
-CORRECT_SYSTEM = """You correct OCR of the credit card that the Classic Arts Showcase TV channel shows at the start and end of each clip. You get the OCR lines and the frame they were read from. Return only a JSON object, no prose and no code fence:
-{"lines": [...], "title": "", "composer": "", "performers": "", "label": ""}
-"lines" is the card's text, one entry per line as printed on the card, in the card's order, with misread characters fixed from the image and OCR noise lines dropped. Keep the card's own wording, including quotes and dates. Do not add lines the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it. The frame may be small or the card partly cut off or fading: return the lines you can read, and when the frame shows no credit text at all return {"lines": []}. Always answer with the JSON object only."""
+# The whole ask goes in the user turn, with the image, so it reaches the model intact even through a gateway that rewrites or drops the system prompt.
+CORRECT_ASK = """This frame is from the Classic Arts Showcase TV channel, which shows a credit card at the start and end of each clip (title, composer, performers, label). My OCR read these lines from it, with mistakes:
+
+{ocr}
+
+Please read the card in the image and give me the corrected text as one JSON object and nothing else, no prose, no code fence:
+{{"lines": [...], "title": "", "composer": "", "performers": "", "label": ""}}
+"lines" is the card's text, one entry per line as printed, in the card's order, with the misread characters fixed from the image and the OCR noise lines dropped. Keep the card's own wording, including quotes and dates, and add no line the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it. The frame may be small, or the card cut off or fading: give the lines you can read, and if the frame shows no credit text at all answer {{"lines": []}}."""
 
 
 def parse_reply(text: str) -> dict:
@@ -290,12 +295,11 @@ class Corrector:
             max_tokens=4096,
             thinking={"type": "disabled"},  # a transcription task; thinking tokens would count against max_tokens
             output_config={"effort": CONFIG["CAS_LLM_EFFORT"]},
-            system=CORRECT_SYSTEM,
             messages=[{
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}},
-                    {"type": "text", "text": "OCR lines:\n" + "\n".join(lines)},
+                    {"type": "text", "text": CORRECT_ASK.format(ocr="\n".join(lines))},
                 ],
             }],
         )
@@ -547,7 +551,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             now = self.now_playing()
             page = render(PAGE).replace("__NOW__", fmt_card(now, "now") if now else '<div class="empty">Between credits; the last card is below.</div>')
-            page = page.replace("__RECENT__", "".join(fmt_card(c) for c in self.recent(50)) or '<div class="empty">Nothing read yet.</div>')
+            rest = [c for c in self.recent(51) if not now or c["id"] != now["id"]][:50]
+            page = page.replace("__RECENT__", "".join(fmt_card(c) for c in rest) or '<div class="empty">Nothing read yet.</div>')
             return self.send(200, page.encode(), "text/html; charset=utf-8")
         self.send(404, b"not found", "text/plain")
 
