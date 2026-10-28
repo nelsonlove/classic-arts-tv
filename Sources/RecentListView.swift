@@ -54,6 +54,11 @@ struct CardRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(card.text)
                     .font(.body)
+                #if !os(tvOS)
+                if !card.links.isEmpty {
+                    FlowLinks(links: card.links)
+                }
+                #endif
                 if let when = card.when {
                     let stamp = showsAge ? "Read \(when.formatted(.relative(presentation: .named)))" : when.formatted(date: .abbreviated, time: .shortened)
                     Text(card.category.map { "\($0) · \(stamp)" } ?? stamp)
@@ -73,3 +78,22 @@ struct CardRow: View {
         #endif
     }
 }
+
+#if !os(tvOS)
+/// The card's links in a wrapping row; a doubtful Wikipedia match is shown dimmer.
+struct FlowLinks: View {
+    let links: [(label: String, url: URL, sure: Bool)]
+
+    var body: some View {
+        // A simple wrap: LazyVGrid with adaptive columns keeps it readable on narrow phones.
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), alignment: .leading)], alignment: .leading, spacing: 4) {
+            ForEach(Array(links.enumerated()), id: \.offset) { _, link in
+                Link(link.label, destination: link.url)
+                    .font(.caption)
+                    .opacity(link.sure ? 1 : 0.6)
+                    .lineLimit(1)
+            }
+        }
+    }
+}
+#endif

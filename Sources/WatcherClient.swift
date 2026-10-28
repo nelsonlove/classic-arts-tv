@@ -10,12 +10,39 @@ struct Card: Identifiable, Decodable, Equatable {
     let cleanLines: [String]?
     let category: String?
     let thumb: String
+    let urls: [String]?
+    let entities: [Entity]?
+    let search: [String: String]?
 
     enum CodingKeys: String, CodingKey {
-        case id, lines, thumb, category
+        case id, lines, thumb, category, urls, entities, search
         case cleanLines = "clean_lines"
         case firstSeen = "first_seen"
         case lastSeen = "last_seen"
+    }
+
+    /// A named person, group or work on the card, with its Wikipedia page when the watcher found one.
+    struct Entity: Decodable, Equatable, Identifiable {
+        let name: String
+        let kind: String
+        let wikipedia: String?
+        let summary: String?
+        let sure: Bool?
+        var id: String { kind + ":" + name }
+    }
+
+    /// Everything the card links to: Wikipedia pages, printed web addresses, then search links.
+    var links: [(label: String, url: URL, sure: Bool)] {
+        var out: [(String, URL, Bool)] = []
+        for e in entities ?? [] {
+            if e.sure == true, let w = e.wikipedia, let u = URL(string: w) { out.append((e.name, u, true)) }
+        }
+        for s in urls ?? [] {
+            if let u = URL(string: s) { out.append((u.host ?? s, u, true)) }
+        }
+        if let y = search?["youtube"], let u = URL(string: y) { out.append(("YouTube", u, true)) }
+        if let a = search?["apple_music"], let u = URL(string: a) { out.append(("Apple Music", u, true)) }
+        return out
     }
 
     /// The model-corrected reading when the watcher has one, else the raw OCR.

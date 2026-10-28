@@ -6,6 +6,8 @@ Nothing here is specific to one machine: every setting is an environment variabl
 
 import base64
 import io
+import urllib.parse
+import urllib.request
 import json
 import os
 import re
@@ -45,6 +47,9 @@ CONFIG = {
     "CAS_LLM_MODEL": os.environ.get("CAS_LLM_MODEL", "claude-haiku-5-5"),
     "CAS_LLM_EFFORT": os.environ.get("CAS_LLM_EFFORT", "low"),
     "CAS_REPO_URL": os.environ.get("CAS_REPO_URL", "https://github.com/nelsonlove/classic-arts-tv"),
+    # Wikipedia lookups for the names on a card. Empty turns them off. Results are cached in the database.
+    "CAS_WIKI_LANG": os.environ.get("CAS_WIKI_LANG", "en"),
+    "CAS_WIKI_CONTACT": os.environ.get("CAS_WIKI_CONTACT", "https://github.com/nelsonlove/classic-arts-tv"),  # Wikimedia asks for a contact in the User-Agent
 }
 
 DB_PATH = CONFIG["CAS_DATA"] / "cards.sqlite"
@@ -168,6 +173,11 @@ def db() -> sqlite3.Connection:
         except sqlite3.OperationalError:
             pass  # column already there
     con.execute("CREATE INDEX IF NOT EXISTS cards_kind ON cards(kind, id)")
+    con.execute("""CREATE TABLE IF NOT EXISTS wiki (
+        name TEXT NOT NULL, kind TEXT NOT NULL, looked_up TEXT NOT NULL,
+        title TEXT, url TEXT, summary TEXT, sure INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (name, kind)
+    )""")
     con.commit()
     return con
 
@@ -179,6 +189,8 @@ def row_to_dict(r: sqlite3.Row) -> dict:
     category = r["category"] or (clean or {}).get("category") or clean_category or ocr_category
     thumb = THUMBS / f"{r['id']}.jpg"
     version = int(thumb.stat().st_mtime) if thumb.exists() else 0
+    shown = clean_lines or lines
+    urls = sorted({u for u in ((clean or {}).get("urls") or []) if isinstance(u, str)} | set(find_urls(shown)))
     return {
         "id": r["id"],
         "first_seen": r["first_seen"],
@@ -189,8 +201,120 @@ def row_to_dict(r: sqlite3.Row) -> dict:
         "lines": lines,
         "clean": clean,
         "clean_lines": clean_lines,
+        "urls": [normalise_url(u) for u in urls],
+        "entities": entities_of(clean),
+        "search": search_links(clean, shown),
         "thumb": f"{CONFIG['CAS_PATH_PREFIX']}/thumbs/{r['id']}.jpg?v={version}",
     }
+
+
+URL_RE = re.compile(r"\b(?:https?://|www\.)[\w.-]+\.[a-z]{2,}(?:/[\w./%-]*)?", re.I)
+
+
+def find_urls(lines: list[str]) -> list[str]:
+    return [m.group(0).rstrip(".") for ln in lines for m in URL_RE.finditer(ln)]
+
+
+def normalise_url(u: str) -> str:
+    return u if u.lower().startswith("http") else "https://" + u
+
+
+def search_links(clean: dict | None, shown: list[str]) -> dict:
+    """Search links that never lie: the title and performers as a query, where a direct link would be a guess."""
+    c = clean or {}
+    parts = [c.get("title") or (shown[0] if shown else ""), c.get("composer") or "", c.get("performers") or ""]
+    q = " ".join(p for p in parts if p).strip()
+    if not q:
+        return {}
+    return {
+        "youtube": "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q),
+        "apple_music": "https://music.apple.com/search?term=" + urllib.parse.quote_plus(q),
+    }
+
+
+WIKI_CACHE: dict[tuple[str, str], dict] = {}
+WIKI_LOCK = threading.Lock()
+
+
+def entities_of(clean: dict | None) -> list[dict]:
+    out = []
+    for e in (clean or {}).get("entities") or []:
+        if not isinstance(e, dict) or not str(e.get("name") or "").strip():
+            continue
+        name, kind = str(e["name"]).strip(), str(e.get("kind") or "other").strip().lower()
+        hit = WIKI_CACHE.get((name, kind))
+        out.append({"name": name, "kind": kind, "wikipedia": (hit or {}).get("url"), "summary": (hit or {}).get("summary"), "sure": bool((hit or {}).get("sure"))})
+    return out
+
+
+# ---------- Wikipedia: one lookup per name, cached, with a visible check ----------
+
+PERFORMER = "pianist|violinist|cellist|violist|musician|soloist|performer|instrumentalist|guitarist|flautist|flutist|organist|harpsichordist|clarinet|oboist|trumpeter|hornist|percussionist|singer|soprano|tenor|baritone|bass|mezzo|contralto|countertenor|dancer|ballerina|actor|actress|entertainer"
+WIKI_WORDS = {
+    "composer": "composer|songwriter", "conductor": "conductor", "soloist": PERFORMER,
+    "singer": PERFORMER, "dancer": PERFORMER + "|ballet", "choreographer": "choreographer|dancer|ballet",
+    "ensemble": "orchestra|ensemble|quartet|choir|chorus|company|band|opera house|philharmonic", "work": "composed|opera|symphony|concerto|ballet|song|sonata|cantata|aria|oratorio|suite|film|work",
+    "film": "film|movie|documentary|animated", "director": "director|filmmaker", "actor": "actor|actress", "label": "record label|label|company", "place": "theatre|theater|hall|opera house|venue|city|church|festival",
+}
+
+
+def wiki_lookup(con: sqlite3.Connection, lock: threading.Lock, name: str, kind: str) -> dict | None:
+    """Look a name up on Wikipedia once; keep the page, its first sentence, and whether the sentence fits the kind."""
+    key = (name, kind)
+    if key in WIKI_CACHE:
+        return WIKI_CACHE[key]
+    with lock:
+        row = con.execute("SELECT title, url, summary, sure FROM wiki WHERE name=? AND kind=?", key).fetchone()
+    if row is not None:
+        WIKI_CACHE[key] = dict(row)
+        return WIKI_CACHE[key]
+    if not CONFIG["CAS_WIKI_LANG"]:
+        return None
+    lang = CONFIG["CAS_WIKI_LANG"]
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # Wikipedia is reached directly, never through a proxy set for the model
+    headers = {"User-Agent": f"cas-watcher/1.0 ({CONFIG['CAS_WIKI_CONTACT']})", "Accept": "application/json"}
+    result = {"title": None, "url": None, "summary": None, "sure": 0}
+    try:
+        q = urllib.parse.urlencode({"action": "query", "list": "search", "srsearch": name, "srlimit": 3, "format": "json"})
+        with opener.open(urllib.request.Request(f"https://{lang}.wikipedia.org/w/api.php?{q}", headers=headers), timeout=20) as r:
+            hits = json.load(r)["query"]["search"]
+        for hit in hits[:3]:
+            title = hit["title"]
+            with opener.open(urllib.request.Request(f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title.replace(' ', '_'))}", headers=headers), timeout=20) as r:
+                page = json.load(r)
+            if page.get("type") == "disambiguation":
+                continue
+            summary = (page.get("extract") or "").split(". ")[0].strip()
+            sure = wiki_sure(name, kind, title, summary)
+            if result["url"] is None or (sure and not result["sure"]):
+                result = {"title": title, "url": page.get("content_urls", {}).get("desktop", {}).get("page"), "summary": summary, "sure": sure}
+            if sure:
+                break
+            time.sleep(0.5)
+    except Exception as e:  # noqa: BLE001
+        log(f"wikipedia lookup failed for {name!r}: {e!r}")
+        return None
+    with lock:
+        con.execute("INSERT OR REPLACE INTO wiki(name, kind, looked_up, title, url, summary, sure) VALUES (?,?,?,?,?,?,?)",
+                    (name, kind, datetime.now(timezone.utc).isoformat(timespec="seconds"), result["title"], result["url"], result["summary"], result["sure"]))
+        con.commit()
+    WIKI_CACHE[key] = result
+    return result
+
+
+def wiki_sure(name: str, kind: str, title: str | None, summary: str | None) -> int:
+    """A match is sure when the page's first sentence fits the kind and the page title is the name."""
+    if not title or not summary:
+        return 0
+    words = re.compile(WIKI_WORDS.get(kind, "."), re.I)
+    return int(bool(words.search(summary)) and similar(title.split(" (")[0], name) >= 0.6)
+
+
+def load_wiki_cache(con: sqlite3.Connection):
+    """Load the lookups made before, judging each again with the current rule."""
+    for row in con.execute("SELECT name, kind, title, url, summary FROM wiki").fetchall():
+        WIKI_CACHE[(row["name"], row["kind"])] = {"title": row["title"], "url": row["url"], "summary": row["summary"],
+                                                  "sure": wiki_sure(row["name"], row["kind"], row["title"], row["summary"])}
 
 
 def display_lines(c: dict) -> list[str]:
@@ -242,8 +366,8 @@ CORRECT_ASK = """This frame is from the Classic Arts Showcase TV channel, which 
 </ocr>
 
 Please read the card in the image and give me the corrected text as one JSON object and nothing else, no prose, no code fence:
-{{"category": "", "lines": [...], "title": "", "composer": "", "performers": "", "label": ""}}
-"lines" is the card's text, one entry per line as printed, in the card's order, with the misread characters fixed from the image and the OCR noise lines dropped. A small lowercase label in the top-left corner of the picture, such as "recital", "ballet" or "music video", is the channel's category for the clip: put it in "category" and never in "lines". Keep the card's own wording, including quotes and dates, and add no line the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it. The frame may be small, or the card cut off or fading: give the lines you can read, and if the frame shows no credit text at all answer {{"lines": []}}."""
+{{"category": "", "lines": [...], "title": "", "composer": "", "performers": "", "label": "", "urls": [], "entities": [{{"name": "", "kind": ""}}]}}
+"lines" is the card's text, one entry per line as printed, in the card's order, with the misread characters fixed from the image and the OCR noise lines dropped. A small lowercase label in the top-left corner of the picture, such as "recital", "ballet" or "music video", is the channel's category for the clip: put it in "category" and never in "lines". Keep the card's own wording, including quotes and dates, and add no line the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it. "urls" holds any web address printed on the card. "entities" lists the named people, groups and works on the card, one entry each, with "name" as the full name as commonly written (so "Lakatos" on the card becomes "Roby Lakatos" when the card makes that clear, and a work keeps its composer's name in the entry) and "kind" one of: composer, conductor, soloist, singer, dancer, choreographer, ensemble, work, film, director, actor, label, place, other. The frame may be small, or the card cut off or fading: give the lines you can read, and if the frame shows no credit text at all answer {{"lines": []}}."""
 
 
 def parse_reply(text: str) -> dict:
@@ -285,11 +409,12 @@ class Corrector:
         if not self.enabled:
             return
         with self.lock:
-            rows = self.con.execute("SELECT id, lines FROM cards WHERE clean IS NULL ORDER BY id DESC LIMIT 300").fetchall()
+            rows = self.con.execute("SELECT id, lines FROM cards WHERE clean IS NULL OR clean NOT LIKE '%\"entities\"%' ORDER BY id DESC LIMIT 300").fetchall()
         for r in rows:
             thumb = THUMBS / f"{r['id']}.jpg"
             if thumb.exists():
                 self._run(r["id"], json.loads(r["lines"]), Image.open(thumb).convert("RGB"))
+                time.sleep(2.0)
 
     def _run(self, card_id: int, lines: list[str], image: Image.Image):
         for attempt in (1, 2):
@@ -304,6 +429,10 @@ class Corrector:
                 log(f"card #{card_id} corrected: " + " | ".join(clean.get("lines") or []))
                 if merged and self.on_merge:
                     self.on_merge(merged)
+                for e in clean.get("entities") or []:
+                    if isinstance(e, dict) and str(e.get("name") or "").strip():
+                        wiki_lookup(self.con, self.lock, str(e["name"]).strip(), str(e.get("kind") or "other").strip().lower())
+                        time.sleep(1.0)  # one request a second is Wikimedia's ask
                 return
             except (anthropic.APIConnectionError, anthropic.RateLimitError, anthropic.InternalServerError) as e:
                 log(f"card #{card_id} correction attempt {attempt} failed, will retry: {e!r}")
@@ -474,7 +603,7 @@ body{font:16px/1.45 -apple-system,system-ui,sans-serif;margin:0;padding:16px;max
 h1{font-size:20px;margin:0 0 4px}h2{font-size:14px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:24px 0 8px}
 .card{display:flex;gap:12px;padding:12px 0;border-top:1px solid var(--line)}.card img{width:120px;height:auto;border-radius:4px;flex:none}
 .card .t{white-space:pre-line}.card time{display:block;color:var(--muted);font-size:13px;margin-top:4px}.now .t{font-size:18px}
-.empty{color:var(--muted)}
+.empty{color:var(--muted)}.links{font-size:13px;margin-top:6px}.links a{color:inherit}
 </style></head><body><h1>Classic Arts Showcase: what's playing</h1><div class="empty"><a href="__P__/watch">Watch here</a> · <a href="https://www.classicartsshowcase.org/watch-classic-arts-showcase/">Watch on the official site</a> · <a href="__P__/about">About this page</a>. Read off the screen credits by a watcher and tidied by a model; refreshes every 30 s.</div>
 <h2>Now playing</h2>__NOW__<h2>Recently played</h2>__RECENT__</body></html>"""
 
@@ -517,9 +646,21 @@ def render(template: str) -> str:
 
 def fmt_card(c: dict, cls: str = "") -> str:
     when = datetime.fromisoformat(c["first_seen"]).astimezone().strftime("%a %H:%M")
-    text = "\n".join(display_lines(c)).replace("&", "&amp;").replace("<", "&lt;")
-    cat = f'{c["category"]} · ' if c.get("category") else ""
-    return f'<div class="card {cls}"><img src="{c["thumb"]}" alt=""><div><div class="t">{text}</div><time>{cat}{when}</time></div></div>'
+    esc = lambda x: str(x).replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+    text = esc("\n".join(display_lines(c)))
+    cat = f'{esc(c["category"])} · ' if c.get("category") else ""
+    links = []
+    for e in c.get("entities") or []:
+        if e.get("wikipedia") and e.get("sure"):
+            links.append(f'<a href="{esc(e["wikipedia"])}" title="{esc(e.get("summary") or "")}">{esc(e["name"])}</a>')
+    for u in c.get("urls") or []:
+        links.append(f'<a href="{esc(u)}">{esc(u.split("//", 1)[-1].rstrip("/"))}</a>')
+    s = c.get("search") or {}
+    if s:
+        links.append(f'<a href="{esc(s["youtube"])}">YouTube</a>')
+        links.append(f'<a href="{esc(s["apple_music"])}">Apple Music</a>')
+    linkrow = f'<div class="links">{" · ".join(links)}</div>' if links else ""
+    return f'<div class="card {cls}"><img src="{c["thumb"]}" alt=""><div><div class="t">{text}</div>{linkrow}<time>{cat}{when}</time></div></div>'
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -606,6 +747,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     CONFIG["CAS_DATA"].mkdir(parents=True, exist_ok=True)
     con = db()
+    load_wiki_cache(con)
     lock = threading.Lock()
     watcher = Watcher(con)
     corrector = Corrector(con, lock, on_merge=watcher.follow_merge)
