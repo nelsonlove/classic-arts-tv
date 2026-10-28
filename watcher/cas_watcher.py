@@ -5,6 +5,7 @@ Nothing here is specific to one machine: every setting is an environment variabl
 """
 
 import base64
+import html
 import io
 import urllib.parse
 import urllib.request
@@ -190,7 +191,9 @@ def row_to_dict(r: sqlite3.Row) -> dict:
     thumb = THUMBS / f"{r['id']}.jpg"
     version = int(thumb.stat().st_mtime) if thumb.exists() else 0
     shown = clean_lines or lines
-    urls = sorted({u for u in ((clean or {}).get("urls") or []) if isinstance(u, str)} | set(find_urls(shown)))
+    urls = sorted({normalise_url(u) for u in ((clean or {}).get("urls") or []) if isinstance(u, str) and u.strip()} | {normalise_url(u) for u in find_urls(shown)})
+    entities = entities_of(clean)
+    search = search_links(clean, shown) if clean and r["kind"] == "clip" else {}
     return {
         "id": r["id"],
         "first_seen": r["first_seen"],
@@ -201,19 +204,19 @@ def row_to_dict(r: sqlite3.Row) -> dict:
         "lines": lines,
         "clean": clean,
         "clean_lines": clean_lines,
-        "urls": [normalise_url(u) for u in urls],
-        "entities": entities_of(clean),
-        "search": search_links(clean, shown),
-        "links": links_of(entities_of(clean), [normalise_url(u) for u in urls], search_links(clean, shown)),
+        "urls": urls,
+        "entities": entities,
+        "search": search,
+        "links": links_of(entities, urls, search),
         "thumb": f"{CONFIG['CAS_PATH_PREFIX']}/thumbs/{r['id']}.jpg?v={version}",
     }
 
 
-URL_RE = re.compile(r"\b(?:https?://|www\.)[\w.-]+\.[a-z]{2,}(?:/[\w./%-]*)?", re.I)
+URL_RE = re.compile(r"\b(?:https?://|www\.)[\w.-]+\.[a-z]{2,}(?:/[\w./%+~:=&?#-]*)?", re.I)
 
 
 def find_urls(lines: list[str]) -> list[str]:
-    return [m.group(0).rstrip(".") for ln in lines for m in URL_RE.finditer(ln)]
+    return [m.group(0).rstrip(".,;:)") for ln in lines for m in URL_RE.finditer(ln)]
 
 
 def normalise_url(u: str) -> str:
@@ -246,19 +249,30 @@ def links_of(entities: list[dict], urls: list[str], search: dict) -> list[dict]:
     out = [{"label": e["name"], "url": e["wikipedia"], "kind": "wikipedia", "note": e.get("summary") or ""} for e in entities if e.get("wikipedia") and e.get("sure")]
     out += [{"label": u.split("//", 1)[-1].rstrip("/"), "url": u, "kind": "site", "note": ""} for u in urls]
     out += [{"label": label, "url": search[key], "kind": "search", "note": ""} for key, label in (("youtube", "YouTube"), ("apple_music", "Apple Music")) if key in search]
-    return out
+    seen, unique = set(), []
+    for link in out:  # two names can share one page, and the same address can be printed twice
+        if link["url"] not in seen:
+            seen.add(link["url"])
+            unique.append(link)
+    return unique
 
 
 WIKI_CACHE: dict[tuple[str, str], dict] = {}
 WIKI_LOCK = threading.Lock()
 
 
-def entities_of(clean: dict | None) -> list[dict]:
+def entity_keys(clean: dict | None) -> list[tuple[str, str]]:
+    """The (name, kind) pairs on a reading, cleaned the one way the lookup table is keyed."""
     out = []
     for e in (clean or {}).get("entities") or []:
-        if not isinstance(e, dict) or not str(e.get("name") or "").strip():
-            continue
-        name, kind = str(e["name"]).strip(), str(e.get("kind") or "other").strip().lower()
+        if isinstance(e, dict) and str(e.get("name") or "").strip():
+            out.append((str(e["name"]).strip().rstrip("."), str(e.get("kind") or "other").strip().lower()))
+    return out
+
+
+def entities_of(clean: dict | None) -> list[dict]:
+    out = []
+    for name, kind in entity_keys(clean):
         hit = WIKI_CACHE.get((name, kind))
         out.append({"name": name, "kind": kind, "wikipedia": (hit or {}).get("url"), "summary": (hit or {}).get("summary"), "sure": bool((hit or {}).get("sure"))})
     return out
@@ -312,8 +326,12 @@ def _wiki_fetch(name: str, kind: str) -> dict | None:
             hits = json.load(r)["query"]["search"]
         for hit in hits[:3]:
             title = hit["title"]
-            with opener.open(urllib.request.Request(f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title.replace(' ', '_'))}", headers=headers), timeout=20) as r:
-                page = json.load(r)
+            try:
+                with opener.open(urllib.request.Request(f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title.replace(' ', '_'), safe='')}", headers=headers), timeout=20) as r:
+                    page = json.load(r)
+            except Exception as e:  # noqa: BLE001  one page's summary failing does not lose a page already found
+                log(f"wikipedia summary failed for {title!r}: {e!r}")
+                continue
             if page.get("type") == "disambiguation":
                 continue
             summary = (page.get("extract") or "").split(". ")[0].strip()
@@ -339,7 +357,7 @@ def wiki_sure(name: str, kind: str, title: str | None, summary: str | None) -> i
     if not title or not summary:
         return 0
     known = kind in WIKI_WORDS
-    words = re.compile(WIKI_WORDS[kind] if known else ALL_WORDS, re.I)
+    words = re.compile(r"\b(?:" + (WIKI_WORDS[kind] if known else ALL_WORDS) + r")\b", re.I)
     page = title.split(" (")[0]
     candidates = [name] + ([name.split(":", 1)[1].strip()] if ":" in name else [])
     score = max(similar(page, c) for c in candidates)
@@ -462,9 +480,8 @@ class Corrector:
         with self.lock:
             rows = self.con.execute("SELECT clean FROM cards WHERE clean IS NOT NULL ORDER BY id DESC LIMIT 500").fetchall()
         for r in rows:
-            for e in (json.loads(r["clean"]) or {}).get("entities") or []:
-                if isinstance(e, dict) and str(e.get("name") or "").strip():
-                    wiki_lookup(self.con, self.lock, str(e["name"]).strip(), str(e.get("kind") or "other").strip().lower())
+            for name, kind in entity_keys(json.loads(r["clean"])):
+                wiki_lookup(self.con, self.lock, name, kind)
 
     def _run(self, card_id: int, lines: list[str], image: Image.Image):
         for attempt in (1, 2):
@@ -479,9 +496,8 @@ class Corrector:
                 log(f"card #{card_id} corrected: " + " | ".join(clean.get("lines") or []))
                 if merged and self.on_merge:
                     self.on_merge(merged)
-                for e in clean.get("entities") or []:
-                    if isinstance(e, dict) and str(e.get("name") or "").strip():
-                        wiki_lookup(self.con, self.lock, str(e["name"]).strip(), str(e.get("kind") or "other").strip().lower())
+                for name, kind in entity_keys(clean):
+                    wiki_lookup(self.con, self.lock, name, kind)
                 return
             except (anthropic.APIConnectionError, anthropic.RateLimitError, anthropic.InternalServerError) as e:
                 log(f"card #{card_id} correction attempt {attempt} failed, will retry: {e!r}")
@@ -697,7 +713,7 @@ def render(template: str) -> str:
 
 def fmt_card(c: dict, cls: str = "") -> str:
     when = datetime.fromisoformat(c["first_seen"]).astimezone().strftime("%a %H:%M")
-    esc = lambda x: str(x).replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+    esc = lambda x: html.escape(str(x), quote=True)
     text = esc("\n".join(display_lines(c)))
     cat = f'{esc(c["category"])} · ' if c.get("category") else ""
     links = [f'<a href="{esc(l["url"])}" title="{esc(l["note"])}">{esc(l["label"])}</a>' for l in c.get("links") or []]
@@ -803,6 +819,16 @@ def main():
         con.commit()
         merge_duplicates(con)
     threading.Thread(target=corrector.backfill, daemon=True, name="backfill").start()
+
+    def sweep_forever():  # names that had no page, or whose lookup failed, are tried again after WIKI_RETRY
+        while True:
+            time.sleep(WIKI_RETRY // 4)
+            try:
+                corrector.wiki_sweep()
+            except Exception as e:  # noqa: BLE001
+                log(f"wiki sweep error: {e!r}")
+
+    threading.Thread(target=sweep_forever, daemon=True, name="wiki-sweep").start()
     Handler.watcher = watcher
     Handler.con = con
     server = ThreadingHTTPServer((CONFIG["CAS_BIND"], CONFIG["CAS_PORT"]), Handler)

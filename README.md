@@ -45,4 +45,6 @@ Classic Arts Showcase publishes no playlist, and the stream carries no metadata.
 
 Install it on any Debian or Ubuntu host with `sudo sh watcher/install.sh` from the `watcher/` folder; settings go in `/etc/cas-watcher.env` (see `cas-watcher.env.example`). It needs about 5% of one CPU thread, under 250 MB of memory, and the stream's bandwidth around the clock: about 13 GB a day at 360p, 18 GB at 480p (set `CAS_STREAM_URL` to the 480p playlist for cleaner reads of names).
 
+Each card also carries links: the web addresses printed on it, Wikipedia pages for the names on it when the match is sure (the page title is the name and its first sentence fits the kind; doubtful matches stay plain names), and YouTube and Apple Music searches for the performance. Wikipedia lookups are cached and run one a second; `CAS_WIKI_LANG` picks the edition or turns them off.
+
 The app polls the watcher every 30 seconds, shows a banner when a new card is read, and lists what played: on iPhone and iPad behind the list button, on Apple TV as a tab in the player's Info panel (swipe down on the remote). The app finds the watcher through `CAS_WATCHER_URL` in `Local.xcconfig` (copy `Local.xcconfig.example`; the file is gitignored, and your Apple team goes in it too), or at run time under `watcherURL` in UserDefaults. Without one, the app is just the player.
