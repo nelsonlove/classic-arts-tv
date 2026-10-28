@@ -350,7 +350,7 @@ def _wiki_fetch(name: str, kind: str) -> dict | None:
 
 
 ALL_WORDS = "|".join(WIKI_WORDS.values())
-ABBREV = re.compile(r"\b(?:No|Op|St|Mt|Dr|Mr|Mrs|Ms|Jr|Sr|vs|etc|[A-Z])\.$")
+ABBREV = re.compile(r"\b(?:No|Op|St|Mt|Dr|Mr|Mrs|Ms|Jr|Sr|vs|etc|[A-Z])$")  # the split has eaten the period
 
 
 def first_sentence(text: str) -> str:
