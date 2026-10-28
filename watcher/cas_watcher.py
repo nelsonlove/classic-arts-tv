@@ -44,10 +44,19 @@ CONFIG = {
     "CAS_LLM_KEY_FILE": os.environ.get("CAS_LLM_KEY_FILE", ""),      # file holding the API key or gateway client key
     "CAS_LLM_MODEL": os.environ.get("CAS_LLM_MODEL", "claude-haiku-5-5"),
     "CAS_LLM_EFFORT": os.environ.get("CAS_LLM_EFFORT", "low"),
+    "CAS_REPO_URL": os.environ.get("CAS_REPO_URL", "https://github.com/nelsonlove/classic-arts-tv"),
 }
 
 DB_PATH = CONFIG["CAS_DATA"] / "cards.sqlite"
 THUMBS = CONFIG["CAS_DATA"] / "thumbs"
+
+# The channel's own notice cards (who pays for it, how to write to it), not clips. Matched on the channel's own wording only.
+NOTICE = re.compile(r"brought to you by|lloyd e\.? ?rigler|classic arts showcase is|welcome your comments|casmail|classicartsshowcase\.org|public service channel|patron of the arts", re.I)
+
+
+def card_kind(lines: list[str]) -> str:
+    return "notice" if NOTICE.search(" ".join(lines)) else "clip"
+
 
 # Words that mark the layout of a credit card, not a title in the picture.
 CARD_HINTS = re.compile(r"\b(music by|conductor|orchestra|choreograph|performed|directed|produced|libretto|soprano|tenor|baritone|pianist|violin|ballet|opera|symphony|quartet|philharmonic|ltd|inc|records|films?)\b", re.I)
@@ -134,10 +143,12 @@ def db() -> sqlite3.Connection:
         lines TEXT NOT NULL
     )""")
     con.execute("CREATE INDEX IF NOT EXISTS cards_last_seen ON cards(last_seen)")
-    try:
-        con.execute("ALTER TABLE cards ADD COLUMN clean TEXT")
-    except sqlite3.OperationalError:
-        pass  # column already there
+    for column in ("clean TEXT", "kind TEXT NOT NULL DEFAULT 'clip'"):
+        try:
+            con.execute(f"ALTER TABLE cards ADD COLUMN {column}")
+        except sqlite3.OperationalError:
+            pass  # column already there
+    con.execute("CREATE INDEX IF NOT EXISTS cards_kind ON cards(kind, id)")
     con.commit()
     return con
 
@@ -149,6 +160,7 @@ def row_to_dict(r: sqlite3.Row) -> dict:
         "first_seen": r["first_seen"],
         "last_seen": r["last_seen"],
         "frames": r["frames"],
+        "kind": r["kind"],
         "lines": json.loads(r["lines"]),
         "clean": clean,
         "clean_lines": (clean or {}).get("lines") or [],
@@ -158,6 +170,41 @@ def row_to_dict(r: sqlite3.Row) -> dict:
 
 def display_lines(c: dict) -> list[str]:
     return c["clean_lines"] or c["lines"]
+
+
+def merge_duplicates(con: sqlite3.Connection, window: int = 1800) -> dict[int, int]:
+    """Merge cards whose cleaned text matches the previous card of the same kind within `window` seconds.
+    The credits show at the start and the end of a clip, and a fade can be read as a new card; the earlier row survives.
+    Returns {merged id: surviving id}. Call under the store lock."""
+    merged: dict[int, int] = {}
+    rows = con.execute("SELECT id, kind, first_seen, last_seen, frames, clean FROM cards WHERE clean IS NOT NULL ORDER BY id").fetchall()
+    last_by_kind: dict[str, sqlite3.Row] = {}
+    survivors: dict[int, dict] = {}
+    for r in rows:
+        text = "\n".join((json.loads(r["clean"]) or {}).get("lines") or [])
+        prev = last_by_kind.get(r["kind"])
+        if prev is not None and text:
+            prev_state = survivors[prev["id"]]
+            gap = (datetime.fromisoformat(r["first_seen"]) - datetime.fromisoformat(prev_state["last_seen"])).total_seconds()
+            if 0 <= gap <= window and similar(text, prev_state["text"]) >= 0.85:
+                prev_state["last_seen"] = max(prev_state["last_seen"], r["last_seen"])
+                prev_state["frames"] += r["frames"]
+                merged[r["id"]] = prev["id"]
+                continue
+        survivors[r["id"]] = {"text": text, "last_seen": r["last_seen"], "frames": r["frames"]}
+        last_by_kind[r["kind"]] = r
+    for gone, kept in merged.items():
+        st = survivors[kept]
+        con.execute("UPDATE cards SET last_seen=?, frames=? WHERE id=?", (st["last_seen"], st["frames"], kept))
+        con.execute("DELETE FROM cards WHERE id=?", (gone,))
+        try:
+            (THUMBS / f"{gone}.jpg").unlink()
+        except FileNotFoundError:
+            pass
+    if merged:
+        con.commit()
+        log("merged duplicate cards: " + ", ".join(f"#{g}->#{k}" for g, k in merged.items()))
+    return merged
 
 
 # ---------- correction by a model that sees the frame ----------
@@ -183,9 +230,10 @@ def parse_reply(text: str) -> dict:
 class Corrector:
     """Sends each new card and its frame to a Claude model through an Anthropic-format endpoint and stores the cleaned reading."""
 
-    def __init__(self, con: sqlite3.Connection, lock: threading.Lock):
+    def __init__(self, con: sqlite3.Connection, lock: threading.Lock, on_merge=None):
         self.con = con
         self.lock = lock
+        self.on_merge = on_merge  # called with {merged id: surviving id} after a merge
         self.client = None
         self.enabled = bool(CONFIG["CAS_LLM_URL"]) and anthropic is not None
         if CONFIG["CAS_LLM_URL"] and anthropic is None:
@@ -218,7 +266,10 @@ class Corrector:
                 with self.lock:
                     self.con.execute("UPDATE cards SET clean=? WHERE id=?", (json.dumps(clean), card_id))
                     self.con.commit()
+                    merged = merge_duplicates(self.con)
                 log(f"card #{card_id} corrected: " + " | ".join(clean.get("lines") or []))
+                if merged and self.on_merge:
+                    self.on_merge(merged)
                 return
             except (anthropic.APIConnectionError, anthropic.RateLimitError, anthropic.InternalServerError) as e:
                 log(f"card #{card_id} correction attempt {attempt} failed, will retry: {e!r}")
@@ -276,6 +327,10 @@ class Watcher(threading.Thread):
         self.current_text = ""
         self.frames_seen = 0
         self.last_frame_at = None
+
+    def follow_merge(self, merged: dict[int, int]):
+        if self.current_id in merged:
+            self.current_id = merged[self.current_id]
 
     def ffmpeg_cmd(self):
         w = CONFIG["CAS_WIDTH"]
@@ -358,8 +413,8 @@ class Watcher(threading.Thread):
             text, lines, first_image, _ = self.pending
             with self.lock:
                 cur = self.con.execute(
-                    "INSERT INTO cards(first_seen, last_seen, frames, text, lines) VALUES (?,?,?,?,?)",
-                    (now, now, count, text, json.dumps(lines)),
+                    "INSERT INTO cards(first_seen, last_seen, frames, text, lines, kind) VALUES (?,?,?,?,?,?)",
+                    (now, now, count, text, json.dumps(lines), card_kind(lines)),
                 )
                 self.con.commit()
                 self.current_id = cur.lastrowid
@@ -386,8 +441,44 @@ h1{font-size:20px;margin:0 0 4px}h2{font-size:14px;text-transform:uppercase;lett
 .card{display:flex;gap:12px;padding:12px 0;border-top:1px solid var(--line)}.card img{width:120px;height:auto;border-radius:4px;flex:none}
 .card .t{white-space:pre-line}.card time{display:block;color:var(--muted);font-size:13px;margin-top:4px}.now .t{font-size:18px}
 .empty{color:var(--muted)}
-</style></head><body><h1>Classic Arts Showcase</h1><div class="empty">Read off the screen credits by a watcher and tidied by a model; the channel publishes no playlist. Refreshes every 30 s.</div>
+</style></head><body><h1>Classic Arts Showcase: what's playing</h1><div class="empty"><a href="__P__/watch">Watch here</a> · <a href="https://www.classicartsshowcase.org/watch-classic-arts-showcase/">Watch on the official site</a> · <a href="__P__/about">About this page</a>. Read off the screen credits by a watcher and tidied by a model; refreshes every 30 s.</div>
 <h2>Now playing</h2>__NOW__<h2>Recently played</h2>__RECENT__</body></html>"""
+
+
+STYLE = PAGE[PAGE.index("<style>"):PAGE.index("</style>") + 8]
+
+WATCH = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Classic Arts Showcase: watch</title>""" + STYLE + """<style>body{max-width:1100px}video{width:100%;background:#000;border-radius:6px}#now{white-space:pre-line;margin-top:12px}</style></head>
+<body><h1>Classic Arts Showcase</h1><div class="empty"><a href="__P__/">What's playing</a> · <a href="https://www.classicartsshowcase.org/watch-classic-arts-showcase/">Official site</a> · <a href="__P__/about">About</a></div>
+<video id="v" controls autoplay playsinline muted></video>
+<div class="empty">The stream starts muted so the browser allows autoplay; press the speaker. <a href="__STREAM__">HLS playlist</a> for any player.</div>
+<h2>Now playing</h2><div id="now" class="empty">…</div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.5/dist/hls.min.js"></script>
+<script>
+const src="__STREAM__", v=document.getElementById("v");
+if (v.canPlayType("application/vnd.apple.mpegurl")) { v.src = src; }
+else if (window.Hls && Hls.isSupported()) { const h = new Hls({liveSyncDurationCount: 3}); h.loadSource(src); h.attachMedia(v); }
+else { document.getElementById("now").textContent = "This browser cannot play HLS; use the playlist link in another player."; }
+async function now(){ try { const r = await fetch("__P__/api/now"); const j = await r.json(); const c = j.now; document.getElementById("now").textContent = c ? (c.clean_lines.length ? c.clean_lines : c.lines).join("\n") : "Between credits."; } catch (e) {} }
+now(); setInterval(now, 30000);
+</script></body></html>"""
+
+ABOUT = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>About this page</title>""" + STYLE + """</head><body><h1>About this page</h1>
+<div class="empty"><a href="__P__/">What's playing</a> · <a href="__P__/watch">Watch</a></div>
+<p><a href="https://www.classicartsshowcase.org/">Classic Arts Showcase</a> is a free, non-commercial 24-hour channel of short clips of ballet, opera, concerts, dance and film, paid for by the Lloyd E. Rigler - Lawrence E. Deutsch Foundation and carried by public-service channels. It publishes no playlist: the only record of a clip is the credit card the channel shows at its start and end.</p>
+<p>This page is not the channel's. A small watcher reads the channel's public stream, decodes one frame every few seconds, reads the credit cards with OCR, has a language model tidy the text while looking at the frame, and keeps one entry per card with a thumbnail. The channel's own notices (who pays for it, how to write to it) are kept out of the list. The stream itself is played straight from the channel's servers; nothing here re-streams it.</p>
+<h2>Links</h2>
+<ul><li><a href="https://www.classicartsshowcase.org/watch-classic-arts-showcase/">The official web player</a></li>
+<li><a href="__STREAM__">The HLS playlist</a>, which plays in VLC, IINA, any IPTV app, or Safari</li>
+<li><a href="__P__/api/now">/api/now</a> and <a href="__P__/api/recent?limit=50">/api/recent</a>: the same data as JSON (add <code>&amp;notices=1</code> to include the channel's notices)</li>
+<li><a href="__REPO__">The source</a>: the watcher and an iPhone, Apple TV and Mac app that plays the stream with these credits</li></ul>
+</body></html>"""
+
+
+def render(template: str) -> str:
+    stream = CONFIG["CAS_STREAM_URL"].rsplit("/", 1)[0] + "/master.m3u8"
+    return template.replace("__P__", CONFIG["CAS_PATH_PREFIX"]).replace("__STREAM__", stream).replace("__REPO__", CONFIG["CAS_REPO_URL"])
 
 
 def fmt_card(c: dict, cls: str = "") -> str:
@@ -414,9 +505,10 @@ class Handler(BaseHTTPRequestHandler):
     def json(self, obj, code=200):
         self.send(code, json.dumps(obj).encode(), "application/json")
 
-    def recent(self, limit: int) -> list[dict]:
+    def recent(self, limit: int, notices: bool = False) -> list[dict]:
+        where = "" if notices else "WHERE kind = 'clip'"
         with self.watcher.lock:
-            rows = self.con.execute("SELECT * FROM cards ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = self.con.execute(f"SELECT * FROM cards {where} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [row_to_dict(r) for r in rows]
 
     def now_playing(self):
@@ -439,7 +531,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"now": self.now_playing(), "watcher": self.status()})
         if path == "/api/recent":
             limit = max(1, min(500, int(q.get("limit", ["50"])[0])))
-            return self.json({"cards": self.recent(limit)})
+            notices = q.get("notices", ["0"])[0] in ("1", "true", "yes")
+            return self.json({"cards": self.recent(limit, notices)})
         if path == "/health":
             return self.json(self.status())
         if path.startswith("/thumbs/") and path.endswith(".jpg") and path[8:-4].isdigit():
@@ -447,9 +540,13 @@ class Handler(BaseHTTPRequestHandler):
             if f.exists():
                 return self.send(200, f.read_bytes(), "image/jpeg")
             return self.send(404, b"no thumb", "text/plain")
+        if path == "/watch":
+            return self.send(200, render(WATCH).encode(), "text/html; charset=utf-8")
+        if path == "/about":
+            return self.send(200, render(ABOUT).encode(), "text/html; charset=utf-8")
         if path == "/":
             now = self.now_playing()
-            page = PAGE.replace("__NOW__", fmt_card(now, "now") if now else '<div class="empty">Between credits; the last card is below.</div>')
+            page = render(PAGE).replace("__NOW__", fmt_card(now, "now") if now else '<div class="empty">Between credits; the last card is below.</div>')
             page = page.replace("__RECENT__", "".join(fmt_card(c) for c in self.recent(50)) or '<div class="empty">Nothing read yet.</div>')
             return self.send(200, page.encode(), "text/html; charset=utf-8")
         self.send(404, b"not found", "text/plain")
@@ -468,9 +565,17 @@ def main():
     CONFIG["CAS_DATA"].mkdir(parents=True, exist_ok=True)
     con = db()
     lock = threading.Lock()
-    corrector = Corrector(con, lock)
-    watcher = Watcher(con, corrector)
+    watcher = Watcher(con)
+    corrector = Corrector(con, lock, on_merge=watcher.follow_merge)
+    watcher.corrector = corrector
     watcher.lock = lock
+    with lock:  # classify cards recorded before the kind column existed
+        for r in con.execute("SELECT id, lines, clean FROM cards WHERE kind = 'clip'").fetchall():
+            lines = json.loads(r["lines"]) + ((json.loads(r["clean"]) or {}).get("lines", []) if r["clean"] else [])
+            if card_kind(lines) == "notice":
+                con.execute("UPDATE cards SET kind='notice' WHERE id=?", (r["id"],))
+        con.commit()
+        merge_duplicates(con)
     threading.Thread(target=corrector.backfill, daemon=True, name="backfill").start()
     Handler.watcher = watcher
     Handler.con = con
