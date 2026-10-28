@@ -152,6 +152,19 @@ CORRECT_SYSTEM = """You correct OCR of the credit card that the Classic Arts Sho
 "lines" is the card's text, one entry per line as printed on the card, in the card's order, with misread characters fixed from the image and OCR noise lines dropped. Keep the card's own wording, including quotes and dates. Do not add lines the card does not show. The other fields are your reading of the card; leave one empty when the card does not give it."""
 
 
+def parse_reply(text: str) -> dict:
+    """Parse the model's JSON, tolerating a code fence, prose around the object, and raw line breaks inside strings."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError(f"no JSON object in the reply: {text[:200]!r}")
+    body = text[start:end + 1]
+    try:
+        return json.loads(body, strict=False)
+    except json.JSONDecodeError:
+        # A line break inside a string: join it with a space and try once more.
+        return json.loads(re.sub(r"(?<=[^,{\[\]}\s\"])\s*\n\s*(?=[^\s,\]}\"])", " ", body), strict=False)
+
+
 class Corrector:
     """Sends each new card and its frame to a Claude model through an Anthropic-format endpoint and stores the cleaned reading."""
 
@@ -177,7 +190,7 @@ class Corrector:
         if not self.enabled:
             return
         with self.lock:
-            rows = self.con.execute("SELECT id, lines FROM cards WHERE clean IS NULL ORDER BY id DESC LIMIT 50").fetchall()
+            rows = self.con.execute("SELECT id, lines FROM cards WHERE clean IS NULL ORDER BY id DESC LIMIT 300").fetchall()
         for r in rows:
             thumb = THUMBS / f"{r['id']}.jpg"
             if thumb.exists():
@@ -222,11 +235,11 @@ class Corrector:
         if response.stop_reason == "refusal":
             raise RuntimeError("the model declined the request")
         text = "".join(b.text for b in response.content if b.type == "text").strip()
-        if text.startswith("```"):
-            text = text.strip("`").split("\n", 1)[-1].rsplit("```", 1)[0]
-        clean = json.loads(text)
+        if response.stop_reason == "max_tokens":
+            log("correction reply was cut at max_tokens")
+        clean = parse_reply(text)
         if not isinstance(clean, dict) or not isinstance(clean.get("lines"), list):
-            raise ValueError("the reply is not the expected JSON object")
+            raise ValueError(f"the reply is not the expected JSON object: {text[:200]!r}")
         clean["lines"] = [str(x).strip() for x in clean["lines"] if str(x).strip()]
         clean["model"] = CONFIG["CAS_LLM_MODEL"]
         return clean
