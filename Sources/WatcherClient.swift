@@ -10,26 +10,13 @@ struct Card: Identifiable, Decodable, Equatable {
     let cleanLines: [String]?
     let category: String?
     let thumb: String
-    let urls: [String]?
-    let entities: [Entity]?
-    let search: [String: String]?
     let links: [LinkItem]?
 
     enum CodingKeys: String, CodingKey {
-        case id, lines, thumb, category, urls, entities, search, links
+        case id, lines, thumb, category, links
         case cleanLines = "clean_lines"
         case firstSeen = "first_seen"
         case lastSeen = "last_seen"
-    }
-
-    /// A named person, group or work on the card, with its Wikipedia page when the watcher found one.
-    struct Entity: Decodable, Equatable, Identifiable {
-        let name: String
-        let kind: String
-        let wikipedia: String?
-        let summary: String?
-        let sure: Bool?
-        var id: String { kind + ":" + name }
     }
 
     /// One link as the watcher lists them: a sure Wikipedia page, a printed web address, or a search link.

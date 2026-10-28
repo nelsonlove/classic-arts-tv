@@ -289,7 +289,8 @@ WIKI_WORDS = {
 }
 
 
-WIKI_RETRY = 86400  # a lookup that found nothing, or failed, is tried again after a day
+WIKI_RETRY = 86400   # a lookup that found no page is tried again after a day
+WIKI_FAIL_RETRY = 900  # a lookup that failed on the network is tried again after a quarter hour
 
 
 def wiki_lookup(con: sqlite3.Connection, lock: threading.Lock, name: str, kind: str) -> dict | None:
@@ -298,17 +299,17 @@ def wiki_lookup(con: sqlite3.Connection, lock: threading.Lock, name: str, kind: 
     key = (name, kind)
     with WIKI_LOCK:
         hit = WIKI_CACHE.get(key)
-        if hit is not None and (hit.get("url") or time.time() - hit.get("at", 0) < WIKI_RETRY):
+        if hit is not None and (hit.get("url") or time.time() - hit.get("at", 0) < (WIKI_FAIL_RETRY if hit.get("failed") else WIKI_RETRY)):
             return hit
         if not CONFIG["CAS_WIKI_LANG"]:
             return None
         result = _wiki_fetch(name, kind)
-        if result is None:  # a network failure: remember the time so it is not retried at once
-            result = {"title": None, "url": None, "summary": None, "sure": 0}
+        if result is None:  # a network failure: remember the time so it is retried soon, not at once
+            result = {"title": None, "url": None, "summary": None, "sure": 0, "failed": True}
         result["at"] = time.time()
         with lock:
-            con.execute("INSERT OR REPLACE INTO wiki(name, kind, looked_up, title, url, summary, sure) VALUES (?,?,?,?,?,?,?)",
-                        (name, kind, datetime.now(timezone.utc).isoformat(timespec="seconds"), result["title"], result["url"], result["summary"], result["sure"]))
+            con.execute("INSERT OR REPLACE INTO wiki(name, kind, looked_up, title, url, summary) VALUES (?,?,?,?,?,?)",
+                        (name, kind, datetime.now(timezone.utc).isoformat(timespec="seconds"), result["title"], result["url"], result["summary"]))
             con.commit()
         WIKI_CACHE[key] = result
         time.sleep(1.0)
@@ -334,8 +335,9 @@ def _wiki_fetch(name: str, kind: str) -> dict | None:
                 continue
             if page.get("type") == "disambiguation":
                 continue
-            summary = (page.get("extract") or "").split(". ")[0].strip()
-            sure = wiki_sure(name, kind, title, summary)
+            extract = (page.get("extract") or "").strip()
+            summary = first_sentence(extract)
+            sure = wiki_sure(name, kind, title, extract)
             if result["url"] is None or (sure and not result["sure"]):
                 result = {"title": title, "url": page.get("content_urls", {}).get("desktop", {}).get("page"), "summary": summary, "sure": sure}
             if sure:
@@ -348,6 +350,18 @@ def _wiki_fetch(name: str, kind: str) -> dict | None:
 
 
 ALL_WORDS = "|".join(WIKI_WORDS.values())
+ABBREV = re.compile(r"\b(?:No|Op|St|Mt|Dr|Mr|Mrs|Ms|Jr|Sr|vs|etc|[A-Z])\.$")
+
+
+def first_sentence(text: str) -> str:
+    """The first sentence for display, not cut at an abbreviation such as No. or St."""
+    out = []
+    for piece in text.split(". "):
+        out.append(piece)
+        if not ABBREV.search(piece):
+            break
+    sentence = ". ".join(out).strip()
+    return sentence if sentence.endswith(".") or sentence == text else sentence + "."
 
 
 def wiki_sure(name: str, kind: str, title: str | None, summary: str | None) -> int:
@@ -372,7 +386,7 @@ def load_wiki_cache(con: sqlite3.Connection):
         except ValueError:
             at = 0
         WIKI_CACHE[(row["name"], row["kind"])] = {"title": row["title"], "url": row["url"], "summary": row["summary"],
-                                                  "sure": wiki_sure(row["name"], row["kind"], row["title"], row["summary"]), "at": at}
+                                                  "sure": wiki_sure(row["name"], row["kind"], row["title"], row["summary"]), "at": at}  # judged on the stored sentence; a lookup made after this version judged on the whole extract
 
 
 def display_lines(c: dict) -> list[str]:
@@ -504,6 +518,9 @@ class Corrector:
                 time.sleep(30)
             except anthropic.APIStatusError as e:
                 log(f"card #{card_id} correction refused by the endpoint: {e.status_code} {e.message}")
+                with self.lock:  # keep the OCR as the reading, marked, so the backfill does not ask again on every restart
+                    self.con.execute("UPDATE cards SET clean=? WHERE id=? AND clean IS NULL", (json.dumps({"lines": [], "entities": [], "urls": [], "error": f"{e.status_code}"}), card_id))
+                    self.con.commit()
                 return
             except Exception as e:  # noqa: BLE001
                 log(f"card #{card_id} correction error: {e!r}")
