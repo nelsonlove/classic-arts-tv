@@ -62,6 +62,21 @@ def log(*parts):
     print(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), *parts, flush=True)
 
 
+# ---------- frames ----------
+
+def crop_to_picture(image: Image.Image, threshold: int = 24) -> Image.Image:
+    """Cut the black bars off: the channel's picture sits inside the 16:9 frame with borders that vary per clip."""
+    box = image.convert("L").point(lambda v: 255 if v > threshold else 0).getbbox()
+    if not box:
+        return image.copy()
+    left, top, right, bottom = box
+    w, h = image.size
+    if (right - left) < w * 0.3 or (bottom - top) < h * 0.3:
+        return image.copy()  # a mostly dark frame: keep it whole
+    pad = 2
+    return image.crop((max(0, left - pad), max(0, top - pad), min(w, right + pad), min(h, bottom + pad)))
+
+
 # ---------- OCR ----------
 
 def ocr(image: Image.Image) -> list[str]:
@@ -350,7 +365,7 @@ class Watcher(threading.Thread):
                 self.current_id = cur.lastrowid
                 self.current_text = text
             THUMBS.mkdir(parents=True, exist_ok=True)
-            thumb = first_image.copy()
+            thumb = crop_to_picture(first_image)
             thumb.thumbnail((320, 320))
             thumb.save(THUMBS / f"{self.current_id}.jpg", quality=80)
             self.pending = None
