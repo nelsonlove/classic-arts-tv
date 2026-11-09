@@ -480,13 +480,22 @@ class Corrector:
         """Correct cards recorded before correction was on, from their thumbnails."""
         if not self.enabled:
             return
-        with self.lock:
-            rows = self.con.execute("SELECT id, lines FROM cards WHERE clean IS NULL OR clean NOT LIKE '%\"entities\"%' ORDER BY id DESC LIMIT 300").fetchall()
-        for r in rows:
-            thumb = THUMBS / f"{r['id']}.jpg"
-            if thumb.exists():
-                self._run(r["id"], json.loads(r["lines"]), Image.open(thumb).convert("RGB"))
-                time.sleep(2.0)
+        # Newest first, in batches, until every card has a reading; a card without a thumbnail is skipped, not retried.
+        before = None
+        while True:
+            with self.lock:
+                rows = self.con.execute(
+                    "SELECT id, lines FROM cards WHERE (clean IS NULL OR clean NOT LIKE '%\"entities\"%') AND id < ? ORDER BY id DESC LIMIT 300",
+                    (before if before is not None else 2**62,),
+                ).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                thumb = THUMBS / f"{r['id']}.jpg"
+                if thumb.exists():
+                    self._run(r["id"], json.loads(r["lines"]), Image.open(thumb).convert("RGB"))
+                    time.sleep(2.0)
+            before = rows[-1]["id"]
         self.wiki_sweep()
 
     def wiki_sweep(self):
