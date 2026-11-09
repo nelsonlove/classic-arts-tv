@@ -5,6 +5,7 @@ Nothing here is specific to one machine: every setting is an environment variabl
 """
 
 import base64
+import collections
 import html
 import io
 import urllib.parse
@@ -180,9 +181,12 @@ def db() -> sqlite3.Connection:
             pass  # column already there
     con.execute("CREATE INDEX IF NOT EXISTS cards_kind ON cards(kind, id)")
     # Readings stamped with an error by earlier versions move their mark to the ledger columns; an empty stub becomes no reading.
-    con.execute("""UPDATE cards SET tried = COALESCE(tried, json_extract(clean, '$.tried'), ''), fail = COALESCE(fail, json_extract(clean, '$.error')),
-                   clean = CASE WHEN json_array_length(json_extract(clean, '$.lines')) = 0 THEN NULL ELSE json_remove(clean, '$.error', '$.tried') END
-                   WHERE clean IS NOT NULL AND json_extract(clean, '$.error') IS NOT NULL""")
+    try:
+        con.execute("""UPDATE cards SET tried = COALESCE(tried, json_extract(clean, '$.tried'), ''), fail = COALESCE(fail, json_extract(clean, '$.error')),
+                       clean = CASE WHEN json_array_length(json_extract(clean, '$.lines')) = 0 THEN NULL ELSE json_remove(clean, '$.error', '$.tried') END
+                       WHERE clean IS NOT NULL AND json_valid(clean) AND json_extract(clean, '$.error') IS NOT NULL""")
+    except sqlite3.OperationalError as e:
+        log(f"the one-time migration of old error stubs did not run: {e!r}")
     con.execute("""CREATE TABLE IF NOT EXISTS wiki (
         name TEXT NOT NULL, kind TEXT NOT NULL, looked_up TEXT NOT NULL,
         title TEXT, url TEXT, summary TEXT, sure INTEGER NOT NULL DEFAULT 0,
@@ -472,6 +476,7 @@ class Corrector:
         self.lock = lock
         self.on_merge = on_merge  # called with {merged id: surviving id} after a merge
         self.stop = threading.Event()
+        self.in_flight: set[int] = set()  # cards the live path is correcting right now
         self.client = None
         self.enabled = bool(CONFIG["CAS_LLM_URL"]) and anthropic is not None
         if CONFIG["CAS_LLM_URL"] and anthropic is None:
@@ -484,83 +489,106 @@ class Corrector:
     def submit(self, card_id: int, lines: list[str], image: Image.Image):
         if not self.enabled:
             return
-        threading.Thread(target=self._run, args=(card_id, lines, image), daemon=True, name=f"correct-{card_id}").start()
+        def live():
+            self.in_flight.add(card_id)
+            try:
+                self._run(card_id, lines, image)
+            finally:
+                self.in_flight.discard(card_id)
+
+        threading.Thread(target=live, daemon=True, name=f"correct-{card_id}").start()
 
     def backfill(self):
         """Give every card a reading: newest first, in batches, cards the live path owns excluded.
-        A card that failed rests until its retry time; a run of transport failures waits and comes back to the first failed card."""
+        A card the model declined rests until its retry time; a card the endpoint could not serve is tried again in a later pass;
+        a run of transport failures, rate limits or request errors waits and comes back to the first card of the run."""
         if not self.enabled:
             return
-        counts = {"ok": 0, "failed": 0, "transport": 0, "busy": 0, "error": 0, "skipped": 0}
+        counts: collections.Counter = collections.Counter()
         try:
             with self.lock:
                 start_id = self.con.execute("SELECT COALESCE(MAX(id), 0) FROM cards").fetchone()[0]  # newer cards belong to the live path
         except Exception as e:  # noqa: BLE001
             log(f"backfill could not start: {e!r}")
             return
-        before = start_id + 1
-        transport_run = 0
-        run_start_id = None
-        while not self.stop.is_set():
-            retry_before = (datetime.now(timezone.utc) - timedelta(seconds=CONFIG["CAS_RETRY_AFTER"])).isoformat(timespec="seconds")
-            try:
-                with self.lock:
-                    rows = self.con.execute(
-                        """SELECT id, lines FROM cards
-                           WHERE (clean IS NULL OR json_extract(clean, '$.entities') IS NULL)
-                             AND (tried IS NULL OR tried < ?)
-                             AND id < ?
-                           ORDER BY id DESC LIMIT ?""",
-                        (retry_before, before, CONFIG["CAS_BACKFILL_BATCH"]),
-                    ).fetchall()
-            except Exception as e:  # noqa: BLE001
-                log(f"backfill query failed, giving up this pass: {e!r}")
-                return
-            if not rows:
-                break
-            resume_from = None
-            for r in rows:
-                if self.stop.is_set():
-                    break
+        summary = lambda: ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "nothing to do"
+        for pass_number in (1, 2, 3):  # a later pass picks up the cards an unsteady endpoint left without a reading
+            before = start_id + 1
+            unresolved = 0
+            bad_run = 0
+            run_start_id = None
+            while not self.stop.is_set():
+                retry_before = (datetime.now(timezone.utc) - timedelta(seconds=CONFIG["CAS_RETRY_AFTER"])).isoformat(timespec="seconds")
                 try:
-                    thumb = THUMBS / f"{r['id']}.jpg"
-                    if not thumb.exists():
-                        self._stamp(r["id"], "no-thumbnail")
-                        counts["skipped"] += 1
+                    with self.lock:
+                        rows = self.con.execute(
+                            """SELECT id, lines FROM cards
+                               WHERE (clean IS NULL OR json_extract(clean, '$.entities') IS NULL)
+                                 AND (tried IS NULL OR tried < ?) AND COALESCE(fail, '') != 'no-thumbnail'
+                                 AND id < ?
+                               ORDER BY id DESC LIMIT ?""",
+                            (retry_before, before, CONFIG["CAS_BACKFILL_BATCH"]),
+                        ).fetchall()
+                except Exception as e:  # noqa: BLE001
+                    log(f"backfill query failed, giving up this pass: {e!r}")
+                    return
+                if not rows:
+                    break
+                resume_from = None
+                for r in rows:
+                    if self.stop.is_set():
+                        break
+                    if r["id"] in self.in_flight:
                         continue
-                    outcome = self._run(r["id"], json.loads(r["lines"]), Image.open(thumb).convert("RGB"), merge=False)
-                    counts[outcome] = counts.get(outcome, 0) + 1
-                    if outcome == "transport":
-                        if transport_run == 0:
+                    try:
+                        thumb = THUMBS / f"{r['id']}.jpg"
+                        if not thumb.exists():
+                            self._stamp(r["id"], "no-thumbnail")  # a card that can never be read is marked once and left out from then on
+                            counts["skipped"] += 1
+                            continue
+                        outcome = self._run(r["id"], json.loads(r["lines"]), Image.open(thumb).convert("RGB"), merge=False)
+                        counts[outcome] += 1
+                        # A run of endpoint trouble (unreachable, rate limited, or refusing every request) is not the cards' fault.
+                        if outcome in ("transport", "busy") or (outcome == "failed" and bad_run > 0):
+                            unresolved += outcome != "failed"
+                            if bad_run == 0:
+                                run_start_id = r["id"]
+                            bad_run += 1
+                            if bad_run >= CONFIG["CAS_BACKFILL_DEAD_RUN"]:
+                                log(f"backfill: {bad_run} cards in a row not served; waiting {CONFIG['CAS_BACKFILL_DEAD_WAIT']:.0f} s, then back to card #{run_start_id}")
+                                resume_from = run_start_id + 1
+                                self.stop.wait(CONFIG["CAS_BACKFILL_DEAD_WAIT"])
+                                bad_run = 0
+                                break
+                        elif outcome == "failed":
+                            bad_run = 1  # one refusal is the card's; several in a row would be the endpoint's
                             run_start_id = r["id"]
-                        transport_run += 1
-                        if transport_run >= CONFIG["CAS_BACKFILL_DEAD_RUN"]:
-                            log(f"backfill: the endpoint failed {transport_run} cards in a row; waiting {CONFIG['CAS_BACKFILL_DEAD_WAIT']:.0f} s, then back to card #{run_start_id}")
-                            resume_from = run_start_id + 1  # exclusive bound: the walk comes back to the first failed card
-                            self.stop.wait(CONFIG["CAS_BACKFILL_DEAD_WAIT"])
-                            transport_run = 0
-                            break
-                    else:
-                        transport_run = 0
-                    self.stop.wait(CONFIG["CAS_BACKFILL_PAUSE"])
-                except Exception as e:  # noqa: BLE001  one bad thumbnail must not end the walk
-                    log(f"backfill: card #{r['id']} skipped: {e!r}")
-                    self._stamp(r["id"], type(e).__name__)
-                    counts["skipped"] += 1
-            summary = ", ".join(f"{v} {k}" for k, v in counts.items() if v)
-            if self.stop.is_set():
-                log(f"backfill stopped below card #{before}: {summary}")
-                return
-            try:
-                with self.lock:
-                    merged = merge_duplicates(self.con)
-                if merged and self.on_merge:
-                    self.on_merge(merged)
-            except Exception as e:  # noqa: BLE001
-                log(f"backfill: merge after the batch failed: {e!r}")
-            before = resume_from if resume_from is not None else rows[-1]["id"]
-            log(f"backfill: down to card #{before}: {summary}")
-        log("backfill done: " + (", ".join(f"{v} {k}" for k, v in counts.items() if v) or "nothing to do"))
+                        else:
+                            bad_run = 0
+                            if outcome == "error":
+                                unresolved += 1
+                        self.stop.wait(CONFIG["CAS_BACKFILL_PAUSE"])
+                    except Exception as e:  # noqa: BLE001  one bad thumbnail must not end the walk
+                        log(f"backfill: card #{r['id']} skipped: {e!r}")
+                        self._stamp(r["id"], type(e).__name__)
+                        counts["skipped"] += 1
+                if self.stop.is_set():
+                    log(f"backfill stopped below card #{before}: {summary()}")
+                    return
+                try:
+                    with self.lock:
+                        merged = merge_duplicates(self.con)
+                    if merged and self.on_merge:
+                        self.on_merge(merged)
+                except Exception as e:  # noqa: BLE001
+                    log(f"backfill: merge after the batch failed: {e!r}")
+                before = resume_from if resume_from is not None else rows[-1]["id"]
+                log(f"backfill pass {pass_number}: down to card #{before}: {summary()}")
+            if unresolved == 0 or self.stop.is_set():
+                break
+            log(f"backfill pass {pass_number} left {unresolved} cards without a reading; another pass after {CONFIG['CAS_BACKFILL_DEAD_WAIT']:.0f} s")
+            self.stop.wait(CONFIG["CAS_BACKFILL_DEAD_WAIT"])
+        log(f"backfill done: {summary()}")
         self.wiki_sweep()
 
     def wiki_sweep(self):
@@ -663,8 +691,9 @@ class Corrector:
         if not isinstance(clean, dict) or not isinstance(clean.get("lines"), list):
             raise ValueError(f"the reply is not the expected JSON object: {text[:200]!r}")
         clean["lines"] = [str(x).strip() for x in clean["lines"] if str(x).strip()]
-        clean.setdefault("entities", [])
-        clean.setdefault("urls", [])
+        for key in ("entities", "urls"):  # a list, or an empty list; never null or a string
+            if not isinstance(clean.get(key), list):
+                clean[key] = []
         clean["model"] = CONFIG["CAS_LLM_MODEL"]
         return clean
 
