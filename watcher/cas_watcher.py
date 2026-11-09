@@ -54,6 +54,8 @@ CONFIG = {
     "CAS_BACKFILL_BATCH": max(1, int(os.environ.get("CAS_BACKFILL_BATCH", "300"))),  # cards per batch when re-reading old cards
     "CAS_BACKFILL_PAUSE": float(os.environ.get("CAS_BACKFILL_PAUSE", "2")),    # seconds between old cards
     "CAS_RETRY_AFTER": int(os.environ.get("CAS_RETRY_AFTER", "86400")),        # seconds before a card the model declined is asked again
+    "CAS_BACKFILL_DEAD_RUN": max(1, int(os.environ.get("CAS_BACKFILL_DEAD_RUN", "5"))),  # transport failures in a row that mean the endpoint is down
+    "CAS_BACKFILL_DEAD_WAIT": float(os.environ.get("CAS_BACKFILL_DEAD_WAIT", "900")),   # seconds to wait then, before trying the same card again
 }
 
 DB_PATH = CONFIG["CAS_DATA"] / "cards.sqlite"
@@ -196,7 +198,7 @@ def row_to_dict(r: sqlite3.Row) -> dict:
     shown = clean_lines or lines
     urls = sorted({normalise_url(u) for u in ((clean or {}).get("urls") or []) if isinstance(u, str) and u.strip()} | {normalise_url(u) for u in find_urls(shown)})
     entities = entities_of(clean)
-    search = search_links(clean, shown) if clean and r["kind"] == "clip" else {}
+    search = search_links(clean, shown) if clean and not clean.get("error") and clean.get("lines") and r["kind"] == "clip" else {}
     return {
         "id": r["id"],
         "first_seen": r["first_seen"],
@@ -512,6 +514,7 @@ class Corrector:
                 return
             if not rows:
                 break
+            resume_from = None  # set when the endpoint looks down: the walk comes back to that card after the wait
             for r in rows:
                 if self.stop.is_set():
                     break
@@ -521,19 +524,34 @@ class Corrector:
                         self._stamp(r["id"], "no-thumbnail")  # marked, so it is not walked again until the retry time
                         skipped += 1
                         continue
-                    outcome = self._run(r["id"], json.loads(r["lines"]), Image.open(thumb).convert("RGB"))
+                    outcome = self._run(r["id"], json.loads(r["lines"]), Image.open(thumb).convert("RGB"), merge=False)
                     sent += 1
-                    transport_failures = transport_failures + 1 if outcome == "transport" else 0
-                    if transport_failures >= 5:
-                        log("backfill: the endpoint failed five cards in a row; waiting 15 minutes before going on")
-                        self.stop.wait(900)
+                    if outcome == "transport":
+                        transport_failures += 1
+                        if transport_failures >= CONFIG["CAS_BACKFILL_DEAD_RUN"]:
+                            log(f"backfill: the endpoint failed {transport_failures} cards in a row; waiting {CONFIG['CAS_BACKFILL_DEAD_WAIT']:.0f} s, then back to card #{r['id'] + transport_failures - 1}")
+                            resume_from = r["id"] + transport_failures  # the first failed card of the run, exclusive bound
+                            self.stop.wait(CONFIG["CAS_BACKFILL_DEAD_WAIT"])
+                            transport_failures = 0
+                            break
+                    else:
                         transport_failures = 0
                     self.stop.wait(CONFIG["CAS_BACKFILL_PAUSE"])
                 except Exception as e:  # noqa: BLE001  one bad thumbnail must not end the walk
                     log(f"backfill: card #{r['id']} skipped: {e!r}")
                     self._stamp(r["id"], type(e).__name__)
                     skipped += 1
-            before = rows[-1]["id"]
+            if self.stop.is_set():
+                log(f"backfill stopped at card #{before}: {sent} sent, {skipped} skipped")
+                return
+            try:
+                with self.lock:
+                    merged = merge_duplicates(self.con)
+                if merged and self.on_merge:
+                    self.on_merge(merged)
+            except Exception as e:  # noqa: BLE001
+                log(f"backfill: merge after the batch failed: {e!r}")
+            before = resume_from if resume_from is not None else rows[-1]["id"]
             log(f"backfill: down to card #{before}, {sent} sent, {skipped} skipped so far")
         log(f"backfill done: {sent} sent, {skipped} skipped")
         self.wiki_sweep()
@@ -547,14 +565,25 @@ class Corrector:
                 wiki_lookup(self.con, self.lock, name, kind)
 
     def _stamp(self, card_id: int, error: str):
-        """Keep the OCR as the reading, marked with the error and the time, so the card is asked again only after CAS_RETRY_AFTER."""
-        stub = {"lines": [], "entities": [], "urls": [], "error": error, "tried": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        with self.lock:
-            self.con.execute("UPDATE cards SET clean=? WHERE id=? AND (clean IS NULL OR json_extract(clean, '$.error') IS NOT NULL)", (json.dumps(stub), card_id))
-            self.con.commit()
+        """Mark the card with the error and the time, so it is asked again only after CAS_RETRY_AFTER.
+        A card with no reading gets an empty stub (the OCR shows); a card with an old reading keeps it and gains the mark."""
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        stub = {"lines": [], "entities": [], "urls": [], "error": error, "tried": now}
+        try:
+            with self.lock:
+                self.con.execute(
+                    """UPDATE cards SET clean = CASE WHEN clean IS NULL THEN ?
+                       ELSE json_set(clean, '$.error', ?, '$.tried', ?, '$.entities', COALESCE(json_extract(clean, '$.entities'), json('[]'))) END
+                       WHERE id=?""",
+                    (json.dumps(stub), error, now, card_id),
+                )
+                self.con.commit()
+        except Exception as e:  # noqa: BLE001  a failed mark is logged, never fatal
+            log(f"card #{card_id} could not be marked: {e!r}")
 
-    def _run(self, card_id: int, lines: list[str], image: Image.Image) -> str:
-        """Correct one card. Returns 'ok', 'transport' (the endpoint could not be reached or answered 5xx), or 'failed'."""
+    def _run(self, card_id: int, lines: list[str], image: Image.Image, merge: bool = True) -> str:
+        """Correct one card. Returns 'ok'; 'busy' (rate limited); 'transport' (the endpoint unreachable, 5xx, or not usable);
+        'failed' (the card is marked and rests until its retry time); or 'error' (something unexpected, logged, not marked)."""
         clean = None
         for attempt in (1, 2, 3):
             if self.stop.is_set():
@@ -564,7 +593,10 @@ class Corrector:
                 break
             except anthropic.RateLimitError as e:  # the endpoint is alive but busy: wait longer, and this is not a dead endpoint
                 log(f"card #{card_id} rate limited, attempt {attempt}: {e!r}")
-                self.stop.wait(60 * attempt)
+                if attempt < 3:
+                    self.stop.wait(60 * attempt)
+                else:
+                    return "busy"
             except (anthropic.APIConnectionError, anthropic.InternalServerError) as e:
                 log(f"card #{card_id} correction attempt {attempt} failed, will retry: {e!r}")
                 if attempt < 3:
@@ -576,10 +608,13 @@ class Corrector:
                     return "failed"
                 log(f"card #{card_id} endpoint not usable: {e.status_code} {e.message}")  # auth, quota, gateway: not the card's fault
                 return "transport"
-            except (RuntimeError, ValueError, json.JSONDecodeError) as e:  # the model declined, or its reply was not the JSON asked for
+            except (RuntimeError, ValueError) as e:  # the model declined, or its reply was not the JSON asked for
                 log(f"card #{card_id} correction error: {e!r}")
                 self._stamp(card_id, type(e).__name__)
                 return "failed"
+            except Exception as e:  # noqa: BLE001  anything else is logged and left for the next pass, never a dead thread
+                log(f"card #{card_id} unexpected error: {e!r}")
+                return "error"
         if clean is None:
             return "transport"
         # The reading is in hand: store it, then the follow-up work, whose failures must not mark the card.
@@ -590,10 +625,11 @@ class Corrector:
             self.con.commit()
         log(f"card #{card_id} corrected: " + " | ".join(clean.get("lines") or []))
         try:
-            with self.lock:
-                merged = merge_duplicates(self.con)
-            if merged and self.on_merge:
-                self.on_merge(merged)
+            if merge:
+                with self.lock:
+                    merged = merge_duplicates(self.con)
+                if merged and self.on_merge:
+                    self.on_merge(merged)
             for name, kind in entity_keys(clean):
                 if self.stop.is_set():
                     break
